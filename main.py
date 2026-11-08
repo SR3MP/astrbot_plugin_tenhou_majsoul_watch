@@ -1,5 +1,5 @@
 """
-天凤 / 雀魂 云观战插件（纯 WebSocket 版）
+天凤 / 雀魂 云观战插件
 
 指令格式参照 wg 云观战体系:
 
@@ -96,7 +96,7 @@ msls [场名|比赛号]       列出雀魂可跟踪对局
 """
 
 
-@register("astrbot_plugin_tenhou_majsoul_watch", "SR3MP", "天凤/雀魂云观战(纯WS)", "3.13.2")
+@register("astrbot_plugin_tenhou_majsoul_watch", "SR3MP", "天凤/雀魂云观战", "3.13.2")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -1693,47 +1693,6 @@ class TenhouWatch(Star):
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, LogReplayParser(code).parse)
         yield event.make_result().message(result)
-
-    # ==================================================================
-    #  旧指令兼容
-    # ==================================================================
-    @filter.command("观战")
-    async def watch_compat(self, event: AstrMessageEvent, arg: str = ""):
-        """观战 [参数]：旧指令，等价于 wg [参数]。"""
-        async for _ in self.wg_track(event, arg):
-            yield _
-
-    @filter.command("看牌")
-    async def replay_compat(self, event: AstrMessageEvent, code: str = ""):
-        """看牌 <牌谱码或链接>：旧指令，等价于 wglog，不带参数只提示改用 wglog。"""
-        code = (code or "").strip()
-        if not code:
-            yield event.make_result().message(
-                "已升级为 wglog 指令，用法: wglog <牌谱码或链接>"
-            )
-            return
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, LogReplayParser(code).parse)
-        yield event.make_result().message(result)
-
-    @filter.command("停观")
-    async def stop_compat(self, event: AstrMessageEvent):
-        """停观：旧指令，等价于不带参数的 wg-，取消本群全部跟踪。"""
-        session = str(event.session)
-        self._th_prune(session)
-        sess = self._th_sessions.get(session) or {}
-        ms_sess = self._ms_sessions.get(session) or {}
-        for s in sess.values():
-            s.stop()
-        for s in ms_sess.values():
-            s.stop()
-        if sess or ms_sess:
-            self._th_sessions.pop(session, None)
-            self._ms_sessions.pop(session, None)
-            yield event.make_result().message(
-                f"已取消全部跟踪（天凤{len(sess)} 场、雀魂{len(ms_sess)} 场）。")
-        else:
-            yield event.make_result().message("当前未跟踪任何对局。")
 
     async def terminate(self):
         for sess in self._th_sessions.values():
