@@ -164,5 +164,4 @@ msls [场名|比赛号]       列出雀魂可跟踪对局
 
 依赖
 ---
-- `websockets`（AstrBot 已内置，不额外拉包）
-- `ms/` 是雀魂客户端协议的 protobuf 生成代码，非本插件手写
+- `websockets`
