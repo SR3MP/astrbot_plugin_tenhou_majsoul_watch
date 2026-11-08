@@ -19,17 +19,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 import time
 from typing import Optional
+
+from astrbot.api import logger
 
 from .broadcast import (event_head, finish_text, now_hm, rank_rows, score_rows,
                         start_text)
 from .majsoul_client import (MSRpcError, UA, decode_action_data,
                              ms_field_label, ms_final_point, ms_short_id)
-
-_LOG = logging.getLogger("astrbot")
 
 WIND_CN = {0: "东", 1: "南", 2: "西", 3: "北"}
 
@@ -108,7 +107,7 @@ def round_label(chang: int, ju: int, ben: int) -> str:
 # =====================================================================
 def _hule_dict(h) -> dict:
     # 取证探针：这些字段哪些真的下发、谁和四家点数变化一致，靠它定；定完就删
-    _LOG.info("[ms-hule] seat=%d zimo=%s yiman=%s count=%d fu=%d sum=%d paid=%d "
+    logger.info("[ms-hule] seat=%d zimo=%s yiman=%s count=%d fu=%d sum=%d paid=%d "
               "rong=%d qin=%d xian=%d title=%s fans=%s"
               % (int(h.seat), bool(h.zimo), bool(h.yiman), int(h.count), int(h.fu),
                  int(h.point_sum), int(h.dadian), int(h.point_rong),
@@ -566,7 +565,7 @@ class MsGameSession:
                 self.mode = "live"
                 return True
             self.note = f"观战节点接入失败（{err}）"
-        _LOG.info(f"[ms-live] #{self.mid} {self.note}")
+        logger.info(f"[ms-live] #{self.mid} {self.note}")
         await self._emit(
             f"#{self.mid} {self.note}，改用牌谱回放；"
             "牌谱可读后推送逐局结算与终局名次。"
@@ -599,7 +598,7 @@ class MsGameSession:
                     break
                 continue
             except Exception as e:
-                _LOG.info(f"[ms-live] #{self.mid} 流中断 {type(e).__name__}: {e}")
+                logger.info(f"[ms-live] #{self.mid} 流中断 {type(e).__name__}: {e}")
                 if retries < self.RECONNECT and await self._reconnect():
                     retries += 1
                     last = time.time()
@@ -610,11 +609,11 @@ class MsGameSession:
             last = time.time()
             if val[0] not in self._frames:
                 # 实时流到底给不给帧只靠这条判定；首帧一行 + 收工一行统计
-                _LOG.info(f"[ms-live] #{self.mid} 观战流首帧 {val[0]}"
+                logger.info(f"[ms-live] #{self.mid} 观战流首帧 {val[0]}"
                           f"（连上后 {int(time.time() - started)} 秒、催帧 {self._pulls} 次）")
             self._frames[val[0]] = self._frames.get(val[0], 0) + 1
             await self._on_live_msg(*val)
-        _LOG.info(f"[ms-live] #{self.mid} 流帧统计 {self._frames or '一帧没给'}"
+        logger.info(f"[ms-live] #{self.mid} 流帧统计 {self._frames or '一帧没给'}"
                   f"，催帧 {self._pulls} 次，重连 {retries} 次")
         if self.finished:
             return True
@@ -808,4 +807,4 @@ class MsGameSession:
         try:
             await self.push(text)
         except Exception as e:
-            _LOG.warning(f"[ms-live] 推送失败: {e}")
+            logger.warning(f"[ms-live] 推送失败: {e}")

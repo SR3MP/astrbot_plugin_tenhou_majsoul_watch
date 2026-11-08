@@ -18,7 +18,6 @@ import asyncio
 import hashlib
 import hmac
 import json
-import logging
 import re
 import threading
 import time
@@ -29,12 +28,12 @@ from typing import Optional
 
 import websockets
 
+from astrbot.api import logger
+
 from .broadcast import finish_text, now_hm, rank_rows, room_start_text
 from .ms.base import MSRPCChannel
 from .ms.rpc import Lobby, Route
 from .ms import protocol_pb2 as pb
-
-log = logging.getLogger("tenhou_majsoul_watch.majsoul")
 
 GAME_URL = "https://game.maj-soul.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -84,7 +83,7 @@ def _koromo_search_player(pl: str, nickname: str) -> list:
         try:
             return _http_json(KOROMO_SEARCH_TPL.format(sh=shard, pl=pl) + quoted) or []
         except Exception as e:
-            log.debug(f"[koromo] 分片 {shard} 查询失败: {e}")
+            logger.debug(f"[koromo] 分片 {shard} 查询失败: {e}")
     return []
 
 # 段位编码规则（新）：level.id = mode*10000 + tier*100 + star
@@ -279,13 +278,13 @@ def decode_action_data(data: bytes):
     norm = _TWIN_MAP.get(base, base)
     cls = getattr(pb, base, None) or getattr(pb, norm, None)
     if cls is None:
-        log.debug(f"[ms] 未知 action 类型: {base}")
+        logger.debug(f"[ms] 未知 action 类型: {base}")
         return None, None
     try:
         m = cls()
         m.MergeFromString(a.value)
     except Exception as e:
-        log.debug(f"[ms] {base} 解析失败: {e}")
+        logger.debug(f"[ms] {base} 解析失败: {e}")
         return None, None
     return norm, m
 
@@ -495,7 +494,7 @@ class MahjongSoulClient:
             return fut.result(75)
         except Exception as e:
             self.last_error = f"{type(e).__name__}: {e}"
-            log.warning(f"[ms] 重连失败: {self.last_error}")
+            logger.warning(f"[ms] 重连失败: {self.last_error}")
             return False
 
     async def _reconnect_async(self) -> bool:
@@ -521,7 +520,7 @@ class MahjongSoulClient:
         try:
             return fut.result(timeout)
         except (ConnectionError, TimeoutError, OSError) as e:
-            log.warning(f"[ms] RPC 失败({type(e).__name__})，重连后重试: {e}")
+            logger.warning(f"[ms] RPC 失败({type(e).__name__})，重连后重试: {e}")
             with self._lock:
                 self._authed = False
                 self._next_conn = 0.0
@@ -537,7 +536,7 @@ class MahjongSoulClient:
             return fut.result(75)
         except Exception as e:
             self.last_error = f"{type(e).__name__}: {e}"
-            log.warning(f"[ms] 登录失败: {self.last_error}")
+            logger.warning(f"[ms] 登录失败: {self.last_error}")
             return False
 
     async def _login_async(self) -> bool:
@@ -568,7 +567,7 @@ class MahjongSoulClient:
                     self._ch = ch
                     return
                 except Exception as e:
-                    log.debug(f"[ms] 网关 {host} 连接失败: {e}")
+                    logger.debug(f"[ms] 网关 {host} 连接失败: {e}")
                     self._ch = None
                     continue
             raise ConnectionError("无法连接雀魂网关")
@@ -612,7 +611,7 @@ class MahjongSoulClient:
         self.access_token = getattr(res, "access_token", "") or self.access_token
         self._authed = True
         self.last_error = ""
-        log.info("[ms] 登录完成")
+        logger.info("[ms] 登录完成")
         return True
 
     @property
@@ -709,7 +708,7 @@ class MahjongSoulClient:
             try:
                 resp = self.stat_raw(account_id) or {}
             except Exception as e:
-                log.debug(f"[ms] 统计取不到 {account_id}: {type(e).__name__}: {e}")
+                logger.debug(f"[ms] 统计取不到 {account_id}: {type(e).__name__}: {e}")
                 return {}
             if not resp:
                 return {}      # 查失败别进缓存，下一场还想再试一次
@@ -951,7 +950,7 @@ class MahjongSoulClient:
         self._fid_logged.add(filter_id)
         cfg = live_list[0].game_config
         tiers = [p.level.id // 100 % 100 for p in live_list[0].players]
-        log.info(f"[ms] live fid={filter_id} 未锚定：mode_id={cfg.meta.mode_id} "
+        logger.info(f"[ms] live fid={filter_id} 未锚定：mode_id={cfg.meta.mode_id} "
                  f"mode={cfg.mode.mode} 行数={len(live_list)} 首家段位={tiers}")
 
     @staticmethod
@@ -1032,7 +1031,7 @@ class MahjongSoulClient:
                 lr = await lobby.fetch_customized_contest_game_live_list(
                     pb.ReqFetchCustomizedContestGameLiveList(unique_id=int(uid)))
             except Exception as e:
-                log.debug(f"[ms] 比赛直播列表失败 uid={uid}: {e}")
+                logger.debug(f"[ms] 比赛直播列表失败 uid={uid}: {e}")
                 lr = None
             if lr is not None and not (lr.HasField("error") and lr.error.code):
                 for lv in lr.live_list:
@@ -1044,7 +1043,7 @@ class MahjongSoulClient:
                 rr = await lobby.fetch_customized_contest_game_records(
                     pb.ReqFetchCustomizedContestGameRecords(unique_id=int(uid)))
             except Exception as e:
-                log.debug(f"[ms] 比赛牌谱索引失败 uid={uid}: {e}")
+                logger.debug(f"[ms] 比赛牌谱索引失败 uid={uid}: {e}")
                 continue
             if rr.HasField("error") and rr.error.code:
                 continue
@@ -1068,7 +1067,7 @@ class MahjongSoulClient:
         try:
             return self._spawn(lambda: self._fetch_account_states(account_ids), 30)
         except Exception as e:
-            log.warning(f"[ms] 状态查询失败: {e}")
+            logger.warning(f"[ms] 状态查询失败: {e}")
             return {}
 
     async def _fetch_account_states(self, account_ids: list) -> dict:
@@ -1348,7 +1347,7 @@ class MahjongSoulWatcher:
                 "live": True,
             })
         except Exception as e:
-            log.debug(f"[ms] on_new_game 失败: {e}")
+            logger.debug(f"[ms] on_new_game 失败: {e}")
 
     # ---- 轮询 ----
 
@@ -1357,14 +1356,14 @@ class MahjongSoulWatcher:
             try:
                 self._poll_once()
             except Exception as e:
-                log.warning(f"[ms] 轮询异常: {type(e).__name__}: {e}")
+                logger.warning(f"[ms] 轮询异常: {type(e).__name__}: {e}")
             self._stop.wait(self._interval)
 
     def _poll_once(self) -> None:
         if not self.watching:
             return
         if not self.client.authed and not self.client.login():
-            log.info(f"[ms] 未登录，跳过本轮: {self.client.last_error}")
+            logger.info(f"[ms] 未登录，跳过本轮: {self.client.last_error}")
             return
         live = self._live_by_uuid()
         playing: dict[str, list[int]] = {}
@@ -1376,7 +1375,7 @@ class MahjongSoulWatcher:
         try:
             states = self.client.get_account_states(list(self.watching))
         except Exception as e:
-            log.debug(f"[ms] fetchAccountState 失败（不影响 live list 主源）: {e}")
+            logger.debug(f"[ms] fetchAccountState 失败（不影响 live list 主源）: {e}")
             states = {}
         for aid, st in states.items():
             uuid_str = st.get("playing_uuid")
@@ -1419,7 +1418,7 @@ class MahjongSoulWatcher:
 
         for uuid_str, game in list(self._games.items()):
             if now - game["start_ts"] > self.GAME_TTL:
-                log.info(f"[ms] 对局 {uuid_str} 超时留档，丢弃")
+                logger.info(f"[ms] 对局 {uuid_str} 超时留档，丢弃")
                 self._games.pop(uuid_str, None)
 
     def _live_by_uuid(self) -> dict:
@@ -1427,7 +1426,7 @@ class MahjongSoulWatcher:
         try:
             return {g["uuid"]: g for g in self.client.get_live_list(max_age=45)}
         except Exception as e:
-            log.debug(f"[ms] live list 拉取失败: {e}")
+            logger.debug(f"[ms] live list 拉取失败: {e}")
             return {}
 
     def _open_game(self, uuid_str: str, members: list[int], lg: Optional[dict]) -> dict:
@@ -1439,7 +1438,7 @@ class MahjongSoulWatcher:
             try:
                 info = self.client.lookup_player(account_id=aid)
             except Exception as e:
-                log.debug(f"[ms] 段位分基线取不到 {aid}: {e}")
+                logger.debug(f"[ms] 段位分基线取不到 {aid}: {e}")
                 info = {}
             if info:
                 start_pt[aid] = info
@@ -1506,11 +1505,11 @@ class MahjongSoulWatcher:
                 self._record_fails += 1
                 if self._record_fails >= self.RECORD_FAIL_LIMIT:
                     self.record_detail = False
-                    log.info(f"[ms] 牌谱接口连续 {self._record_fails} 次报错"
+                    logger.info(f"[ms] 牌谱接口连续 {self._record_fails} 次报错"
                              f"（{e}），改用段位分变化播报")
             return None
         except Exception as e:
-            log.debug(f"[ms] 牌谱拉取失败: {e}")
+            logger.debug(f"[ms] 牌谱拉取失败: {e}")
             return None
         self._record_fails = 0
         head = rec.get("head") or {}

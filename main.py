@@ -96,7 +96,27 @@ msls [场名|比赛号]       列出雀魂可跟踪对局
 """
 
 
-@register("astrbot_plugin_tenhou_majsoul_watch", "SR3MP", "天凤/雀魂云观战", "3.13.2")
+PLUGIN_NAME = "astrbot_plugin_tenhou_majsoul_watch"
+STATE_FILE_NAME = "sub_state.json"
+
+
+def _plugin_data_dir() -> str:
+    """插件数据目录 data/plugin_data/<插件名>/，由 AstrBot 统一管理和迁移。"""
+    try:
+        from astrbot.api.star import StarTools
+
+        path = StarTools.get_data_dir(PLUGIN_NAME)
+        if path:
+            return str(path)
+    except Exception as e:
+        logger.debug(f"[tenhou] StarTools.get_data_dir 不可用，按默认规则推算: {e}")
+    root = os.environ.get("ASTRBOT_ROOT") or os.getcwd()
+    path = os.path.join(root, "data", "plugin_data", PLUGIN_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.13.3")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -146,9 +166,13 @@ class TenhouWatch(Star):
         self._loop = None
         self._hydrate_task = None
 
-        # 订阅/监听状态落盘（持久化），默认存插件目录下
-        self._state_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "sub_state.json"
+        # 订阅/监听状态落盘（持久化）：存 data/plugin_data/<插件名>/，
+        # 不写插件自身目录——插件目录升级时会被整目录替换，也便于用户迁移与审计。
+        self._data_dir = _plugin_data_dir()
+        self._state_file = os.path.join(self._data_dir, STATE_FILE_NAME)
+        # 旧版写在插件目录里，读到就一次性搬走，搬完留 .migrated 备查
+        self._legacy_state_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), STATE_FILE_NAME
         )
         self._load_state()
 
@@ -234,12 +258,31 @@ class TenhouWatch(Star):
     # ==================================================================
     #  持久化: 订阅 + 监听状态
     # ==================================================================
+    def _state_source(self) -> tuple[str, bool]:
+        """返回待读取的状态文件，以及它是否为旧版插件目录内路径。"""
+        if os.path.exists(self._state_file):
+            return self._state_file, False
+        legacy = self._legacy_state_file
+        if legacy and os.path.exists(legacy):
+            return legacy, True
+        return "", False
+
+    def _migrate_state_file(self, legacy: str) -> None:
+        """把旧版插件目录里的状态文件搬到 plugin_data，旧文件改名留档。"""
+        try:
+            self._save_state()
+            os.replace(legacy, legacy + ".migrated")
+            logger.info(f"[tenhou] 订阅状态已迁移到 {self._state_file}")
+        except Exception as e:
+            logger.warning(f"[tenhou] 订阅状态迁移未完成（旧文件保留）: {e}")
+
     def _load_state(self) -> None:
         """启动时恢复各群订阅（天凤对局跟踪不恢复，需重新 wg）。"""
+        path, is_legacy = self._state_source()
+        if not path:
+            return
         try:
-            if not os.path.exists(self._state_file):
-                return
-            with open(self._state_file, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
         except Exception as e:
             logger.warning(f"[tenhou] 读取订阅状态失败: {e}")
@@ -276,6 +319,9 @@ class TenhouWatch(Star):
                 nick = ms_names.get(str(aid)) or ""
                 if nick and nick != str(aid):
                     self._ms_watcher.add(aid, nick)
+
+        if is_legacy:
+            self._migrate_state_file(path)
 
         logger.info(
             f"[tenhou] 已恢复订阅: 天凤{len(self._subs)}个会话, "

@@ -18,17 +18,16 @@ import re
 import ssl
 import threading
 import time
-import logging
 import base64
 import urllib.request
 from urllib.parse import unquote
 
 import websockets
 
+from astrbot.api import logger
+
 from .broadcast import (event_head, finish_text, now_hm, room_start_text,
                         score_rows)
-
-_LOG = logging.getLogger("astrbot")
 
 WS_URL = "wss://b-ww.mjv.jp"
 WG_LIST_TPL = "https://tenhou.net/0/wg/{lobby}.js"
@@ -850,7 +849,7 @@ class ThGameSession:
             try:
                 self.on_finish(p)
             except Exception as e:
-                _LOG.warning(f"[th] 终局回调失败: {e}")
+                logger.warning(f"[th] 终局回调失败: {e}")
             return
         await self._emit(end_render(self.mid, p, self.watchers))
 
@@ -860,7 +859,7 @@ class ThGameSession:
         try:
             await self.push(text)
         except Exception as e:
-            _LOG.warning(f"[th] 推送失败: {e}")
+            logger.warning(f"[th] 推送失败: {e}")
 
     # ---- 查询 -------------------------------------------------------
     def brief(self) -> str:
@@ -956,7 +955,7 @@ class ThWatcher:
                 self._tick()
             except Exception as e:
                 self.last_error = f"{type(e).__name__}: {str(e)[:120]}"
-                _LOG.warning(f"[th] 自动播报轮询失败: {e}")
+                logger.warning(f"[th] 自动播报轮询失败: {e}")
 
     def _rows(self) -> tuple:
         """(去重后的对局行, 是否至少有一个大厅拉成功)。"""
@@ -988,7 +987,7 @@ class ThWatcher:
         try:
             self.on_new_game(game)
         except Exception as e:
-            _LOG.warning(f"[th] 新对局挂跟踪失败: {e}")
+            logger.warning(f"[th] 新对局挂跟踪失败: {e}")
 
     def _tick(self) -> None:
         if not self.names:
@@ -1048,7 +1047,7 @@ class ThWatcher:
         try:
             self.notifier(text, names, rule_name, wg)
         except Exception as e:
-            _LOG.warning(f"[th] 自动播报回调失败: {e}")
+            logger.warning(f"[th] 自动播报回调失败: {e}")
 
     def _sample(self) -> None:
         """给在打的订阅对局碰一次牌流，只记录不播报（散场的名次靠它）。"""
