@@ -164,13 +164,5 @@ msls [场名|比赛号]       列出雀魂可跟踪对局
 
 依赖
 ---
-- `requirements.txt` 只含 `websockets`（AstrBot 已内置，不会额外拉包）
-- `ms/protocol_pb2.py` 和 `ms/rpc.py` 是雀魂客户端协议（`protocol.proto`）的生成产物，插件不手写这两个文件
-- 运行时在插件目录生成 `sub_state.json`（订阅状态），`.gitignore` 已排除，不应提交
-
-作者与仓库
----
-- 作者：SR3MP
-- 仓库：https://github.com/SR3MP/astrbot_plugin_tenhou_majsoul_watch
-- 许可证：MIT，见 `LICENSE`
-- 版本与更新记录见 `metadata.yaml`
+- `websockets`（AstrBot 已内置，不额外拉包）
+- `ms/` 是雀魂客户端协议的 protobuf 生成代码，非本插件手写
