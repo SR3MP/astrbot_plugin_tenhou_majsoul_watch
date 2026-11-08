@@ -1,0 +1,33 @@
+{
+  "majsoul": {
+    "type": "object",
+    "description": "雀魂账号配置",
+    "hint": "用于雀魂玩家查询/对局监控的账号。留空则雀魂相关指令（msadd/mspt/监控）不可用，其余指令不受影响。",
+    "items": {
+      "email": {
+        "type": "string",
+        "description": "雀魂账号邮箱",
+        "hint": "maj-soul.com 账号的登录邮箱",
+        "default": ""
+      },
+      "password": {
+        "type": "string",
+        "description": "雀魂账号密码",
+        "hint": "maj-soul.com 账号的登录密码",
+        "default": ""
+      },
+      "token": {
+        "type": "string",
+        "description": "雀魂访问令牌",
+        "hint": "可选。已登录获取的 access_token，填了则跳过账号密码登录",
+        "default": ""
+      },
+      "poll_interval": {
+        "type": "int",
+        "description": "监控轮询间隔(秒)",
+        "hint": "后台检测订阅玩家对局状态的间隔，建议 20~60 秒",
+        "default": 30
+      }
+    }
+  }
+}

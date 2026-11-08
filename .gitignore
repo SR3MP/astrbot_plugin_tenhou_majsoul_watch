@@ -1,0 +1,12 @@
+# 运行时产物：订阅状态、日志缓存、平台数据目录，不入库
+sub_state.json
+data/
+__pycache__/
+*.py[cod]
+*.bak
+*.bak.*
+
+# 本地编辑/系统文件
+.idea/
+.vscode/
+.DS_Store

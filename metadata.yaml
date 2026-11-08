@@ -1,0 +1,11 @@
+name: astrbot_plugin_tenhou_watch
+display_name: 天凤/雀魂云观战
+desc: 天凤/雀魂云观战：订阅玩家、跟踪对局、按 wg 格式推送
+short_desc: 天凤/雀魂云观战，订阅玩家开局/散场自动播报，wg 码逐局推分
+help: 发送 wghelp 查看帮助
+version: v3.13.2
+author: SR3MP
+repo: https://github.com/SR3MP/astrbot_plugin_tenhou_watch
+astrbot_version: ">=4.0.0"
+dependencies:
+  - websockets>=12
