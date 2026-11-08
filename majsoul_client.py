@@ -2,7 +2,7 @@
 雀魂 WebSocket 客户端（CN 服 maj-soul.com）
 核心实现：连接网关 + 登录 + 玩家详情/对局记录 RPC。
 修复说明：请求连接握手必须携带 platform="Web"(proto字段6)，否则网关返回错误码151。
-本模块供 astrbot_plugin_tenhou_watch 使用；HTTP 端点已被官方废弃（405），一律走 WS。
+本模块供 astrbot_plugin_tenhou_majsoul_watch 使用；HTTP 端点已被官方废弃（405），一律走 WS。
 
 实测（2026-11 CN 服）：实时观战走 Lobby.fetchOBToken(uuid) 拿票，再连登录网关
 同主机的 wss://route-N/ob（协议见 ms_live.open_observe）；createGameObserveAuth
@@ -34,7 +34,7 @@ from .ms.base import MSRPCChannel
 from .ms.rpc import Lobby, Route
 from .ms import protocol_pb2 as pb
 
-log = logging.getLogger("tenhou_watch.majsoul")
+log = logging.getLogger("tenhou_majsoul_watch.majsoul")
 
 GAME_URL = "https://game.maj-soul.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

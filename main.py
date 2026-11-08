@@ -96,7 +96,7 @@ msls [场名|比赛号]       列出雀魂可跟踪对局
 """
 
 
-@register("astrbot_plugin_tenhou_watch", "SR3MP", "天凤/雀魂云观战(纯WS)", "3.13.2")
+@register("astrbot_plugin_tenhou_majsoul_watch", "SR3MP", "天凤/雀魂云观战(纯WS)", "3.13.2")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)

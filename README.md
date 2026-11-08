@@ -11,7 +11,7 @@
 AstrBot 插件市场搜索「天凤/雀魂云观战」，或将仓库 `git clone` / 下载到 `data/plugins/` 后重启：
 
 ```
-data/plugins/astrbot_plugin_tenhou_watch/
+data/plugins/astrbot_plugin_tenhou_majsoul_watch/
 ```
 
 安装后在群内发送 `wghelp` 查看全部指令；雀魂账号可选，不配置时天凤全部功能与雀魂 `mspt` 昵称查询仍可用。
@@ -220,6 +220,6 @@ msls [场名|比赛号]       列出雀魂可跟踪对局
 作者与仓库
 ---
 - 作者：SR3MP
-- 仓库：https://github.com/SR3MP/astrbot_plugin_tenhou_watch
+- 仓库：https://github.com/SR3MP/astrbot_plugin_tenhou_majsoul_watch
 - 许可证：MIT，见 `LICENSE`
 - 版本与更新记录见 `metadata.yaml`
