@@ -62,10 +62,12 @@ from .majsoul_client import (
     MahjongSoulClient,
     MahjongSoulWatcher,
     MS_LIVE_FID_FIELD,
+    koromo_blocked_reason,
     ms_field_label,
     ms_format_pt,
     ms_level_text,
     ms_short_id,
+    set_koromo_token,
 )
 from .ms_live import MsGameSession
 
@@ -116,7 +118,7 @@ def _plugin_data_dir() -> str:
     return path
 
 
-@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.13.3")
+@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.13.4")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -136,6 +138,8 @@ class TenhouWatch(Star):
                                      on_new_game=self._th_new_game)
         # 雀魂账号配置（来自插件配置 _conf_schema.json / WebUI）
         ms_cfg = (config or {}).get("majsoul") or {}
+        # 牌谱屋反爬要 cap token：配置里填了就带上，没填就只按 AID 查
+        set_koromo_token(str(((config or {}).get("koromo") or {}).get("token", "")))
         self._ms_client = MahjongSoulClient(
             email=str(ms_cfg.get("email", "")),
             password=str(ms_cfg.get("password", "")),
@@ -223,12 +227,55 @@ class TenhouWatch(Star):
         # 天凤：把各会话订阅的玩家名并成一个监听集合，开局/散场自动播报
         self._th_sync_watcher()
         self._th_watcher.start()
-        # 旧状态里只存了账号数字，登录后把昵称补回来（推送显示用）
-        self._hydrate_task = asyncio.create_task(self._hydrate_ms_names())
+        # 旧状态里只存了账号数字，登录后把昵称补回来（推送显示用）。
+        # 顺带在激活时就登录一次：旧版只在"有订阅"或"打指令"时才登，
+        # 于是刚配好账号、还没订阅时 wgls 一直显示未登录，昵称反查也只能
+        # 落到已经挂掉的牌谱屋上。登录放后台任务，不拖慢插件激活。
+        self._hydrate_task = asyncio.create_task(self._ms_warmup())
         logger.info(
             f"[tenhou] 初始化完成: 天凤订阅{len(self._subs)}个, "
             f"雀魂订阅{len(self._ms_subs)}个（开局/终局自动播，逐局播报要 wg）"
         )
+
+    async def _ms_warmup(self) -> None:
+        """激活/热重载后主动登录雀魂，再补齐订阅昵称。
+
+        没配账号就跳过；登录失败把原因写进日志，并留 3 次退避重试。
+        不再让"没有订阅所以不登录"演成"账号没生效"。
+        """
+        if not self._ms_client.has_credentials:
+            logger.info("[tenhou] 未配置雀魂账号，跳过登录（昵称反查不可用，只能按 AID）")
+            return
+        ok = await asyncio.to_thread(self._ms_client.ensure_connection)
+        for attempt in (1, 2, 3):
+            if ok:
+                break
+            logger.warning(
+                f"[tenhou] 雀魂登录失败（第{attempt}次）: "
+                f"{self._ms_client.last_error or '原因未知'}，60 秒后重试")
+            await asyncio.sleep(60)
+            ok = await asyncio.to_thread(self._ms_client.ensure_connection)
+        if ok:
+            logger.info(f"[tenhou] 雀魂账号登录成功（自己 AID={self._ms_client.self_aid}）")
+        else:
+            logger.error(
+                f"[tenhou] 雀魂登录连续失败，已停止重试: "
+                f"{self._ms_client.last_error or '原因未知'}")
+        await self._hydrate_ms_names()
+
+    def _ms_nick_hint(self) -> str:
+        """昵称反查失败时的补充说明：区分"被反爬拦了"和"真的没这个人"。"""
+        if not self._ms_client.has_credentials:
+            head = "未配置雀魂账号，昵称反查只能用牌谱屋"
+        elif not self._ms_client.authed:
+            head = "雀魂未登录（" + (self._ms_client.last_error or "原因未知") + "）"
+        else:
+            head = "已登录，但官方昵称搜索没命中"
+        reason = koromo_blocked_reason()
+        if reason:
+            head += f"；{reason}"
+            head += "。要按昵称查需在插件配置的 koromo.token 填牌谱屋 key"
+        return head + "\n也可直接用 AID: mspt <AID> 或 /msadd $<AID>"
 
     async def _hydrate_ms_names(self) -> None:
         """登录后按 AID 补齐订阅昵称并落盘。
@@ -998,8 +1045,13 @@ class TenhouWatch(Star):
             lines.append("雀魂筛选: 不限")
         lines.append(f"雀魂推送: {'开启' if ms_sub['enabled'] else '关闭'}")
         lines.append(f"雀魂监控: {ms_watching}")
-        if not self._ms_client.authed:
-            lines.append("（雀魂未登录：仅能按昵称查询牌谱屋，无法监控对局。请在插件配置中填写账号）")
+        if self._ms_client.authed:
+            lines.append("雀魂登录: 已认证")
+        elif not self._ms_client.has_credentials:
+            lines.append("（雀魂未配置账号：无法监控对局，昵称反查也只剩牌谱屋可用。请在插件配置中填写账号）")
+        else:
+            err = self._ms_client.last_error or "尚未完成登录"
+            lines.append(f"（雀魂未登录：{err}。账号已配置，会自动重试；也可发 wgstat 看状态）")
 
         yield event.make_result().message("\n".join(lines))
 
@@ -1093,7 +1145,8 @@ class TenhouWatch(Star):
                     found = await asyncio.to_thread(
                         self._ms_client.lookup_player, None, raw)
                     if not found.get("account_id"):
-                        yield event.make_result().message(f"未找到玩家: {player_id}")
+                        yield event.make_result().message(
+                            f"未找到玩家: {player_id}\n{self._ms_nick_hint()}")
                         return
                     account_id = found["account_id"]
                     nickname = found.get("nickname", raw)
@@ -1115,7 +1168,8 @@ class TenhouWatch(Star):
                     yield event.make_result().message("\n".join(lines))
                     return
                 else:
-                    yield event.make_result().message(f"未找到玩家: {player_id}")
+                    yield event.make_result().message(
+                        f"未找到玩家: {player_id}\n{self._ms_nick_hint()}")
                     return
 
         # 已登录且还没拿到昵称，尝试补全（用于显示）
@@ -1254,8 +1308,12 @@ class TenhouWatch(Star):
                 if account_id is not None and not logged_in:
                     yield event.make_result().message(
                         "未登录时无法按 AID 查询。\n"
-                        "请用昵称查询: mspt <昵称>"
+                        "请在插件配置里填写雀魂账号，或改用昵称: mspt <昵称>"
                     )
+                    return
+                if account_id is None:
+                    yield event.make_result().message(
+                        f"未找到玩家: {player_id}\n{self._ms_nick_hint()}")
                     return
                 yield event.make_result().message(f"未找到玩家: {player_id}")
                 return
@@ -1741,6 +1799,9 @@ class TenhouWatch(Star):
         yield event.make_result().message(result)
 
     async def terminate(self):
+        # 热重载时旧实例的登录/补昵称任务要停掉，否则它会继续退避重试并刷日志
+        if self._hydrate_task and not self._hydrate_task.done():
+            self._hydrate_task.cancel()
         for sess in self._th_sessions.values():
             for s in sess.values():
                 s.stop()

@@ -29,5 +29,18 @@
         "default": 30
       }
     }
+  },
+  "koromo": {
+    "type": "object",
+    "description": "牌谱屋昵称反查（可选）",
+    "hint": "只影响 mspt / msadd 按昵称查。牌谱屋自 2026-11 起要求 cap token，未配置时这两条只能按 AID 用（如 mspt 12345678）。需要昵称反查的话，可向牌谱屋作者申请 key 填在这里。",
+    "items": {
+      "token": {
+        "type": "string",
+        "description": "牌谱屋 cap token",
+        "hint": "填写后作为 x-cap-token 请求头发给 amae-koromo；留空则昵称反查不可用，不影响 AID 查询与对局监控",
+        "default": ""
+      }
+    }
   }
 }

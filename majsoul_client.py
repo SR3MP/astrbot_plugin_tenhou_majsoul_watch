@@ -19,9 +19,11 @@ import hashlib
 import hmac
 import json
 import re
+import ssl
 import threading
 import time
 import uuid
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Optional
@@ -39,10 +41,55 @@ GAME_URL = "https://game.maj-soul.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-# 雀魂牌谱屋（amae-koromo）公开 API，用于按昵称反查 account_id，无需登录。
-# 前端在 1/2/4/5-data 之间轮换，实测只有部分分片可解析结果，故按序尝试。
+# 雀魂牌谱屋（amae-koromo）公开 API，用于按昵称反查 account_id。
+# 2026-11 实测：该接口已全面挂上 Cap.js 工作量证明，不带 cap token 一律
+# 429 + "[x-cap-token-required] CAPTCHA required"（站点明说要爬就找作者要 key），
+# 分片 1/2/4 也已不再解析，只剩 5 号分片且同样被拦。所以昵称反查改为
+# 「官方 RPC 优先、牌谱屋兜底」，被拦时如实告诉用户改用 AID，
+# 而不是把"被反爬"伪装成"查无此人"。
 KOROMO_SHARDS = ("5", "1", "2", "4")
 KOROMO_SEARCH_TPL = "https://{sh}-data.amae-koromo.com/api/v2/{pl}/search_player/"
+
+# 牌谱屋最近一次被反爬拦下的原因（空串 = 没被拦过）
+_KOROMO_BLOCKED = ""
+# 牌谱屋 cap token（配置里填了才会带 x-cap-token；留空 = 走不通昵称反查）
+_KOROMO_TOKEN = ""
+# 官方昵称搜索不可用只警告一次，免得每查一个昵称刷一条
+_SEARCH_RPC_WARNED = False
+
+
+def set_koromo_token(token: str) -> None:
+    """由插件配置注入牌谱屋 cap token（留空表示没有）。"""
+    global _KOROMO_TOKEN
+    _KOROMO_TOKEN = (token or "").strip()
+
+
+def _warn_search_once(msg: str) -> None:
+    global _SEARCH_RPC_WARNED
+    if not _SEARCH_RPC_WARNED:
+        _SEARCH_RPC_WARNED = True
+        logger.warning(f"[ms] 官方昵称搜索不可用（昵称反查只剩牌谱屋/AID）: {msg}")
+
+
+def _ssl_ctx() -> ssl.SSLContext:
+    """带完整证书校验的 TLS 上下文。
+
+    旧版为了绕开精简镜像缺根证书，直接 CERT_NONE + 关 hostname 校验，
+    等于给中间人开门。这里保留默认校验，只额外补一份 certifi 的 CA bundle：
+    镜像是没装 ca-certificates 也能验通——补 CA，而不是放弃验证。
+    """
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception as e:      # 没有 certifi：系统根证书照样能验
+        logger.debug(f"[ms] 载入 certifi CA 失败，使用系统根证书: {e}")
+    return ctx
+
+
+def koromo_blocked_reason() -> str:
+    """牌谱屋被反爬拦下的原因（空串 = 可用或还没探测过）。"""
+    return _KOROMO_BLOCKED
 
 # fetchGameLiveList 的 filter_id 实测分布（2026-11 CN 服，取满 100 条样本统计人数与玩家段位）：
 #   208/209 四人 雀杰~雀豪   211/212 四人 雀豪~雀圣   216 四人 雀圣以上
@@ -64,11 +111,11 @@ MS_LIVE_FID_FIELD = {208: "金", 209: "金", 211: "玉", 212: "玉", 216: "王�
 
 def _http_json(url: str, timeout: float = 8.0):
     """简单的 GET + JSON 解析，带超时，供牌谱屋等公开接口使用。"""
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UA,
-        "Accept": "application/json",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    headers = {"User-Agent": UA, "Accept": "application/json"}
+    if _KOROMO_TOKEN:
+        headers["x-cap-token"] = _KOROMO_TOKEN
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx()) as resp:
         body = resp.read().decode("utf-8", "replace")
     return json.loads(body)
 
@@ -77,11 +124,25 @@ def _koromo_search_player(pl: str, nickname: str) -> list:
     """牌谱屋按昵称搜索（pl=pl4/pl3），逐个分片试，命中即返回。
 
     分片域名会轮换，单个分片挂了属常态，全部失败才返回 []。
+    429 / x-cap-token-required 会记进 _KOROMO_BLOCKED，供上层给出准确提示。
     """
+    global _KOROMO_BLOCKED
     quoted = urllib.parse.quote(nickname)
     for shard in KOROMO_SHARDS:
         try:
-            return _http_json(KOROMO_SEARCH_TPL.format(sh=shard, pl=pl) + quoted) or []
+            items = _http_json(KOROMO_SEARCH_TPL.format(sh=shard, pl=pl) + quoted)
+            _KOROMO_BLOCKED = ""
+            return items or []
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            if e.code == 429 or "cap-token" in detail:
+                _KOROMO_BLOCKED = "牌谱屋已启用 captcha（HTTP 429 x-cap-token-required）"
+                logger.debug(f"[koromo] 被反爬拦下: {detail[:120]}")
+            else:
+                logger.debug(f"[koromo] 分片 {shard} HTTP {e.code}: {detail[:120]}")
         except Exception as e:
             logger.debug(f"[koromo] 分片 {shard} 查询失败: {e}")
     return []
@@ -460,6 +521,9 @@ class MahjongSoulClient:
         self._cvs = ""
         self._route_id = 0
         self.last_error = ""
+        # 登录回包里的自己账号（0 = 还没登过），用于把昵称反查落到自己身上
+        self._self_aid = 0
+        self._self_nick = ""
         self._live_cache: list = []
         self._live_cache_at = 0.0
         # 段位/PT 缓存：account_id → (时间, fetchAccountInfo 结果)
@@ -547,11 +611,11 @@ class MahjongSoulClient:
 
     async def _connect_async(self):
         async with _session() as s:
-            async with s.get(f"{GAME_URL}/1/version.json", ssl=False) as r:
+            async with s.get(f"{GAME_URL}/1/version.json") as r:
                 self._version = (await r.json())["version"]
-            async with s.get(f"{GAME_URL}/1/v{self._version}/config.json", ssl=False) as r:
+            async with s.get(f"{GAME_URL}/1/v{self._version}/config.json") as r:
                 self._cfg = await r.json()
-            async with s.get(f"{GAME_URL}/1/", ssl=False) as r:
+            async with s.get(f"{GAME_URL}/1/") as r:
                 html = await r.text()
             pm = re.search(r"productVersion\s*:\s*[\"']([^\"']+)[\"']", html)
             self._cvs = f"web-{pm.group(1) if pm else self._version.replace('.w', '')}"
@@ -609,6 +673,13 @@ class MahjongSoulClient:
         res = await lobby.login(req)
         _check_error(res, "login")
         self.access_token = getattr(res, "access_token", "") or self.access_token
+        # 回包里带自己的 account_id：记下来，昵称反查可以优先认自己
+        self._self_aid = int(getattr(res, "account_id", 0) or 0) or self._self_aid
+        try:
+            if res.HasField("account") and res.account.nickname:
+                self._self_nick = res.account.nickname
+        except Exception:
+            pass
         self._authed = True
         self.last_error = ""
         logger.info("[ms] 登录完成")
@@ -617,6 +688,21 @@ class MahjongSoulClient:
     @property
     def authed(self) -> bool:
         return self._authed and self._ch is not None and self._ch.alive
+
+    @property
+    def has_credentials(self) -> bool:
+        """配置里填了账号密码（能不能登，登了才知道）。"""
+        return bool(self.email and self.password)
+
+    @property
+    def self_aid(self) -> int:
+        """登录回包里的自己的 account_id（0 = 未登录或拿不到）。"""
+        return int(self._self_aid or 0)
+
+    @property
+    def self_nick(self) -> str:
+        """登录回包里的自己的昵称（空串 = 未知）。"""
+        return self._self_nick or ""
 
     def lookup_player(self, account_id=None, nickname=None) -> dict:
         """查询玩家段位/PT（account_id 优先，其次按昵称搜索）。
@@ -802,8 +888,11 @@ class MahjongSoulClient:
     def _search_aid_by_nickname(self, nickname: str) -> Optional[int]:
         """按昵称搜索 account_id。
 
-        顺序：牌谱屋 API(免登录) → 实时观战列表 → 官方 searchAccountByPattern。
-        返回精确匹配的第一个 account_id；找不到返回 None。
+        顺序：自己（登录回包）→ 官方 searchAccountByPattern → 牌谱屋 → 实时观战列表。
+        返回精确匹配的 account_id；找不到返回 None。
+
+        牌谱屋从 2026-11 起要 captcha token（429 x-cap-token-required），基本必空，
+        所以把官方 RPC 提到前面：配了账号就走登录态，不再指望第三方站点。
         """
         try:
             return self._spawn(
@@ -812,8 +901,39 @@ class MahjongSoulClient:
             return None
 
     async def _search_by_nickname_async(self, nickname: str) -> Optional[int]:
-        # 1) 牌谱屋（amae-koromo）公开 API：按昵称反查 account_id，无需登录态。
-        #    先查四人场(pl4)，再查三人场(pl3)，取精确匹配的第一个。
+        nickname = (nickname or "").strip()
+        if not nickname:
+            return None
+        # 1) 自己：login 回包已经给了 account_id（多半还带昵称），对上就直接用
+        if self._self_aid:
+            if nickname == self._self_nick:
+                return self._self_aid
+            try:
+                own = await self._fetch_info(self._self_aid)
+                if (own or {}).get("nickname") == nickname:
+                    return self._self_aid
+            except Exception:
+                pass
+        # 2) 官方 searchAccountByPattern（需登录态；国服多数不实现，报错就往下走）
+        try:
+            lobby = Lobby(self._ch)
+            req = pb.ReqSearchAccountByPattern()
+            req.pattern = nickname
+            res = await lobby.search_account_by_pattern(req)
+            code = res.error.code if (res.error and res.error.code) else 0
+            if code:
+                _warn_search_once(f"searchAccountByPattern 返回 error.code={code}")
+            else:
+                for aid in res.match_accounts:
+                    try:
+                        info = await self._fetch_info(aid)
+                    except Exception:
+                        continue
+                    if info.get("nickname") == nickname:
+                        return aid
+        except Exception as e:
+            _warn_search_once(f"{type(e).__name__}: {e}")
+        # 3) 牌谱屋（amae-koromo）免登录兜底：现在多半被 captcha 拦成空
         for suffix in ("pl4", "pl3"):
             try:
                 items = await asyncio.to_thread(_koromo_search_player, suffix, nickname)
@@ -822,7 +942,7 @@ class MahjongSoulClient:
                         return int(item["id"])
             except Exception:
                 continue
-        # 2) 实时观战列表精确匹配（覆盖正在对局的玩家，需登录态）
+        # 4) 实时观战列表精确匹配（只覆盖正在对局的人）
         try:
             live = await self._fetch_live_list()
             for game in live:
@@ -831,24 +951,7 @@ class MahjongSoulClient:
                         return p["account_id"]
         except Exception:
             pass
-        # 3) 官方 searchAccountByPattern（服务器大多不支持，命中为空则返回 None）
-        lobby = Lobby(self._ch)
-        req = pb.ReqSearchAccountByPattern()
-        req.pattern = nickname
-        res = await lobby.search_account_by_pattern(req)
-        if res.error and res.error.code:
-            return None
-        first = None
-        for aid in res.match_accounts:
-            try:
-                info = await self._fetch_info(aid)
-            except Exception:
-                continue
-            if first is None:
-                first = aid
-            if info.get("nickname") == nickname:
-                return aid
-        return first
+        return None
 
     async def _fetch_info(self, aid: int) -> dict:
         lobby = Lobby(self._ch)
@@ -1222,8 +1325,9 @@ class MahjongSoulClient:
 
 
 def _session():
+    """HTTP 会话：TLS 走完整证书校验（旧版这里是 ssl=False，等于不验证书）。"""
     import aiohttp
-    return aiohttp.ClientSession()
+    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=_ssl_ctx()))
 
 
 class MahjongSoulWatcher:

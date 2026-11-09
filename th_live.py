@@ -53,9 +53,18 @@ def tile_name(tid: int) -> str:
 
 
 def _ssl_ctx() -> ssl.SSLContext:
+    """天凤 HTTPS / WSS 的 TLS 上下文：完整校验证书链。
+
+    旧版为了绕开"精简镜像缺根证书"直接 CERT_NONE 并关掉 hostname 检查，
+    等于给中间人开门。这里保留默认校验，只额外补一份 certifi 的 CA bundle，
+    镜像没装 ca-certificates 时也能验通——补 CA，而不是放弃验证。
+    """
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        import certifi
+        ctx.load_verify_locations(certifi.where())
+    except Exception as e:      # 没有 certifi：系统根证书照样能验
+        logger.debug(f"[tenhou] 载入 certifi CA 失败，使用系统根证书: {e}")
     return ctx
 
 
