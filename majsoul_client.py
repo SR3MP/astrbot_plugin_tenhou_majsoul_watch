@@ -139,7 +139,8 @@ def _koromo_search_player(pl: str, nickname: str) -> list:
             except Exception:
                 detail = ""
             if e.code == 429 or "cap-token" in detail:
-                _KOROMO_BLOCKED = "牌谱屋已启用 captcha（HTTP 429 x-cap-token-required）"
+                _KOROMO_BLOCKED = (
+                    "牌谱屋对当前网络出口限流（HTTP 429 x-cap-token-required）")
                 logger.debug(f"[koromo] 被反爬拦下: {detail[:120]}")
             else:
                 logger.debug(f"[koromo] 分片 {shard} HTTP {e.code}: {detail[:120]}")

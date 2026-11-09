@@ -118,7 +118,7 @@ def _plugin_data_dir() -> str:
     return path
 
 
-@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.13.4")
+@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.13.5")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -273,8 +273,8 @@ class TenhouWatch(Star):
             head = "已登录，但官方昵称搜索没命中"
         reason = koromo_blocked_reason()
         if reason:
-            head += f"；{reason}"
-            head += "。要按昵称查需在插件配置的 koromo.token 填牌谱屋 key"
+            head += (f"{reason}；可换网络重试，"
+                     "或在插件配置 koromo.token 填写牌谱屋 key")
         return head + "\n也可直接用 AID: mspt <AID> 或 /msadd $<AID>"
 
     async def _hydrate_ms_names(self) -> None:
