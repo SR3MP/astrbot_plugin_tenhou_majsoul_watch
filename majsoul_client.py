@@ -1356,12 +1356,15 @@ class MahjongSoulWatcher:
     RECORD_WAIT_CODES = (1203, 540)
 
     def __init__(self, client, notifier, poll_interval: int = 30,
-                 on_new_game=None):
+                 on_new_game=None, contest_ids=None):
         self.client = client
         # notifier(text, account_ids, field)：由 main 决定推给哪些会话
         self._notifier = notifier
         # 发现新的订阅对局时把这场交给主程序（和天凤同一条路：主程序去挂观战流收终局）
         self.on_new_game = on_new_game
+        # 返回"要额外侦测的比赛号"（本群登记的比赛场）。段位场靠 live list，
+        # 比赛场得按 contest_id 单独查，所以每轮多这一份。
+        self._contest_ids = contest_ids or (lambda: [])
         self._interval = max(15, int(poll_interval))
         self.watching: dict[int, str] = {}   # account_id → 昵称
         self._games: dict[str, dict] = {}    # uuid → 对局状态
@@ -1471,6 +1474,16 @@ class MahjongSoulWatcher:
             logger.info(f"[ms] 未登录，跳过本轮: {self.client.last_error}")
             return
         live = self._live_by_uuid()
+        for cid in self._contest_ids_safe():
+            try:
+                rows = self.client.get_contest_rows(2, contest_id=cid) or []
+            except Exception as e:
+                logger.debug(f"[ms] 比赛 {cid} 直播列表失败: {e}")
+                continue
+            for row in rows:
+                # 只认进行中的：record_limit 那几行是终局牌谱索引，不能当开局
+                if row.get("live", True) and row.get("uuid"):
+                    live.setdefault(row["uuid"], row)
         playing: dict[str, list[int]] = {}
         for uuid_str, row in live.items():
             members = sorted({int(p["account_id"]) for p in row.get("players", [])
@@ -1533,6 +1546,14 @@ class MahjongSoulWatcher:
         except Exception as e:
             logger.debug(f"[ms] live list 拉取失败: {e}")
             return {}
+
+    def _contest_ids_safe(self) -> list:
+        """登记的比赛号；回调出错就当没有，别让一轮轮询整个挂掉。"""
+        try:
+            return list(self._contest_ids() or [])
+        except Exception as e:
+            logger.debug(f"[ms] 取登记比赛号失败: {e}")
+            return []
 
     def _open_game(self, uuid_str: str, members: list[int], lg: Optional[dict]) -> dict:
         players = list((lg or {}).get("players", []))

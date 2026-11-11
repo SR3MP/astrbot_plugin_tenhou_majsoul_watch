@@ -95,11 +95,15 @@ msdel <AID|昵称|$AID>    取消订阅雀魂玩家
 msfilter [场...]         只播报指定雀魂场，all 清空
 mspt <AID|昵称|$AID>     查雀魂段位和 PT
 msls [场名|比赛号]       列出雀魂可跟踪对局
+msaddc <比赛号>          登记比赛场，wg 可跟踪、订阅玩家在该场开局会播报
+msdelc <比赛号>          取消登记比赛场
 """
 
 
 PLUGIN_NAME = "astrbot_plugin_tenhou_majsoul_watch"
 STATE_FILE_NAME = "sub_state.json"
+# 登记的比赛场上限：每场每轮要 2 个 RPC（直播列表 + 牌谱索引），别让人一次登记几十个
+MS_CONTEST_LIMIT = 5
 
 
 def _plugin_data_dir() -> str:
@@ -118,7 +122,7 @@ def _plugin_data_dir() -> str:
     return path
 
 
-@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.13.5")
+@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.13.6")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -150,7 +154,8 @@ class TenhouWatch(Star):
         self._ms_subs: dict[str, dict] = {}
         self._ms_watcher = MahjongSoulWatcher(
             self._ms_client, self._ms_notify, poll_interval=poll,
-            on_new_game=self._ms_new_game
+            on_new_game=self._ms_new_game,
+            contest_ids=self._ms_contest_ids_for_watch,
         )
         # 雀魂观战: session_id → {四位码 → MsGameSession}（同样只有 wg 显式指定才跟踪）
         self._ms_sessions: dict[str, dict[str, MsGameSession]] = {}
@@ -166,6 +171,9 @@ class TenhouWatch(Star):
         # 比赛场对局缓存（比赛列表 + 每场最近终局牌谱索引）
         self._ms_contest: Optional[list[dict]] = None
         self._ms_contest_at = 0.0
+        # 登记的比赛场对局缓存（按比赛号直查，与上面那份分开存）
+        self._ms_contest_reg: Optional[list[dict]] = None
+        self._ms_contest_reg_at = 0.0
         # 主循环在 initialize() 里抓取后才能安全调度推送，这里先不起线程
         self._loop = None
         self._hydrate_task = None
@@ -349,12 +357,15 @@ class TenhouWatch(Star):
             }
         for sid, sub in ms_subs.items():
             accounts = set(sub.get("accounts", []))
-            if not accounts:
+            contests = [int(c) for c in (sub.get("contests") or []) if str(c).isdigit()]
+            # 只登记了比赛场的会话也要留住，否则重启后 wg 又找不到那些比赛
+            if not accounts and not contests:
                 continue
             self._ms_subs[sid] = {
                 "accounts": accounts,
                 "enabled": bool(sub.get("enabled", True)),
                 "filters": list(sub.get("filters", [])),
+                "contests": contests,
             }
         # 恢复昵称（只认已订阅的账号），否则重启后推送里只剩一串数字
         for sid, sub in ms_subs.items():
@@ -391,6 +402,7 @@ class TenhouWatch(Star):
                     "accounts": sorted(sub.get("accounts", [])),
                     "enabled": bool(sub.get("enabled", True)),
                     "filters": list(sub.get("filters", [])),
+                    "contests": sorted(int(c) for c in (sub.get("contests") or [])),
                 }
             # 昵称只在订阅时拿得到，重启后要靠它显示，所以一并落盘
             names = {
@@ -652,8 +664,10 @@ class TenhouWatch(Star):
     def _get_ms_sub(self, session: str) -> dict:
         if session not in self._ms_subs:
             self._ms_subs[session] = {
-                "accounts": set(), "enabled": True, "filters": [],
+                "accounts": set(), "enabled": True, "filters": [], "contests": [],
             }
+        else:
+            self._ms_subs[session].setdefault("contests", [])
         return self._ms_subs[session]
 
     # ==================================================================
@@ -953,10 +967,48 @@ class TenhouWatch(Star):
             self._ms_contest_at = time.time()
         return list(self._ms_contest or [])
 
+    def _ms_contest_ids(self) -> list[int]:
+        """本插件登记过的比赛号（跨会话去重），供 wg / 监控线程使用。"""
+        ids = set()
+        for sub in self._ms_subs.values():
+            for c in sub.get("contests") or []:
+                try:
+                    ids.add(int(c))
+                except (TypeError, ValueError):
+                    continue
+        return sorted(ids)
+
+    def _ms_contest_ids_for_watch(self) -> list[int]:
+        """监控线程每轮额外侦测的比赛号，按登记顺序取前 MS_CONTEST_LIMIT 场。"""
+        return self._ms_contest_ids()[:MS_CONTEST_LIMIT]
+
+    async def _ms_registered_contest_games(self, force: bool = False) -> list[dict]:
+        """登记的比赛场：按比赛号直查进行中 + 最近终局的对局。
+
+        默认那份 fetchCustomizedContestList 只给"账号参加过的比赛"，
+        msls <比赛号> 和这里都走 contest_id 直查，不受这个限制。
+        """
+        ids = self._ms_contest_ids()
+        if not ids:
+            return []
+        now = time.time()
+        if force or now - self._ms_contest_reg_at > 60:
+            rows: list[dict] = []
+            for cid in ids[:MS_CONTEST_LIMIT]:
+                try:
+                    rows += await asyncio.to_thread(
+                        self._ms_client.get_contest_rows, 3, cid)
+                except Exception as e:
+                    logger.warning(f"[ms] 比赛 {cid} 拉取失败: {e}")
+            self._ms_contest_reg = rows
+            self._ms_contest_reg_at = now
+        return list(self._ms_contest_reg or [])
+
     async def _ms_all_games(self, force: bool = False) -> list[dict]:
         """段位场 + 比赛场，wg <四位码> 就是在这份合并列表里找。"""
         games = await self._ms_live_games(force)
         games += await self._ms_contest_games(force)
+        games += await self._ms_registered_contest_games(force)
         return games
 
     async def _ms_games_for_mid(self, code: str) -> list[dict]:
@@ -1045,10 +1097,12 @@ class TenhouWatch(Star):
             lines.append("雀魂筛选: 不限")
         lines.append(f"雀魂推送: {'开启' if ms_sub['enabled'] else '关闭'}")
         lines.append(f"雀魂监控: {ms_watching}")
+        contests = ms_sub.get("contests") or []
+        lines.append("比赛场: " + (", ".join(str(c) for c in contests) if contests else "无"))
         if self._ms_client.authed:
             lines.append("雀魂登录: 已认证")
         elif not self._ms_client.has_credentials:
-            lines.append("（雀魂未配置账号：无法监控对局，昵称反查也只剩牌谱屋可用。请在插件配置中填写账号）")
+            lines.append("（未配置雀魂账号：无法监控对局，昵称反查仅牌谱屋可用，请在插件配置中填写账号）")
         else:
             err = self._ms_client.last_error or "尚未完成登录"
             lines.append(f"（雀魂未登录：{err}。账号已配置，会自动重试；也可发 wgstat 看状态）")
@@ -1615,6 +1669,8 @@ class TenhouWatch(Star):
         session = str(event.session)
         sub = self._get_ms_sub(session)
         accounts = set(sub.get("accounts") or [])
+        # 查比赛号就是为了拿四位码去 wg，顺手登记，省一次 msaddc
+        note = self._ms_register_contest(sub, int(arg)) if by_id else ""
         filters = [] if by_id else ([arg] if arg else (sub.get("filters") or []))
         # 已终局的行按终局时间排（服务端那个顺序才是"最新几场"的意思）
         newest = lambda g: -int(g.get("end_time") or g.get("start_time") or 0)
@@ -1660,8 +1716,83 @@ class TenhouWatch(Star):
                 lines.append(f"  {full[:44]}" + (f"（比赛号 {cid}）" if cid else ""))
             lines += self._ms_hit_lines(games, limit) or ["  无"]
         lines.append("wg m<四位码> 开始跟踪，wg- m<四位码> 取消。")
-        lines.append("比赛场和拿不到观战票的段位场走终局后的牌谱回放。")
+        if note:
+            lines.append(note)
         yield event.make_result().message("\n".join(lines))
+
+    def _ms_register_contest(self, sub: dict, cid: int) -> str:
+        """msls <比赛号> 查到对局后登记这个比赛场，返回给用户的提示语。"""
+        reg = sub.setdefault("contests", [])
+        if cid in reg:
+            return ""
+        if len(self._ms_contest_ids()) >= MS_CONTEST_LIMIT:
+            return (f"登记已满 {MS_CONTEST_LIMIT} 场，未登记比赛 {cid}；"
+                    "可先 msdelc 取消不用的场。")
+        reg.append(cid)
+        self._save_state()
+        return f"已登记比赛 {cid}，wg m<四位码> 可跟踪该场对局；不需要时发 msdelc {cid}。"
+
+    @filter.command("msaddc")
+    async def msadd_contest(self, event: AstrMessageEvent, contest_id: str = ""):
+        """msaddc <比赛号>：登记比赛场，wg 可跟踪，订阅玩家在该场开局会播报。"""
+        cid = (contest_id or "").strip().lstrip("#")
+        if not cid.isdigit():
+            yield event.make_result().message(
+                "用法: msaddc <比赛号>\n"
+                "比赛号是雀魂比赛页里的数字，可先用 msls <比赛号> 确认能查到对局")
+            return
+        session = str(event.session)
+        reg = self._get_ms_sub(session).setdefault("contests", [])
+        if int(cid) in reg:
+            yield event.make_result().message(f"比赛 {cid} 已在登记中。")
+            return
+        if len(self._ms_contest_ids()) >= MS_CONTEST_LIMIT:
+            yield event.make_result().message(
+                f"最多同时登记 {MS_CONTEST_LIMIT} 场比赛，先用 msdelc 取消不用的。")
+            return
+        if not await asyncio.to_thread(self._ms_client.ensure_connection):
+            yield event.make_result().message(
+                "雀魂未登录，无法校验比赛号：" + (self._ms_client.last_error or "原因未知"))
+            return
+        try:
+            rows = await asyncio.to_thread(
+                self._ms_client.get_contest_rows, 3, int(cid))
+        except Exception as e:
+            yield event.make_result().message(f"比赛 {cid} 查询失败: {e}")
+            return
+        reg.append(int(cid))
+        self._save_state()
+        # 登记表变了，按比赛号直查的那份缓存立刻作废
+        self._ms_contest_reg = None
+        self._ms_contest_reg_at = 0.0
+
+        name = next((r.get("contest_full") for r in rows if r.get("contest_full")), "")
+        live = [r for r in rows if r.get("live", True) and r.get("uuid")]
+        lines = [f"已登记比赛 {cid}" + (f"（{name}）" if name else "")]
+        if live:
+            lines.append(f"当前进行中 {len(live)} 场:")
+            lines += self._ms_hit_lines(live, 5)
+        else:
+            lines.append("当前没有进行中的对局。")
+        lines.append("订阅玩家在该场开局会播报；也可 wg m<四位码> 手动跟踪。")
+        yield event.make_result().message("\n".join(lines))
+
+    @filter.command("msdelc")
+    async def msdel_contest(self, event: AstrMessageEvent, contest_id: str = ""):
+        """msdelc <比赛号>：取消登记的比赛场。"""
+        cid = (contest_id or "").strip().lstrip("#")
+        if not cid.isdigit():
+            yield event.make_result().message("用法: msdelc <比赛号>")
+            return
+        reg = self._get_ms_sub(str(event.session)).setdefault("contests", [])
+        if int(cid) not in reg:
+            yield event.make_result().message(f"比赛 {cid} 没有登记。")
+            return
+        reg.remove(int(cid))
+        self._save_state()
+        self._ms_contest_reg = None
+        self._ms_contest_reg_at = 0.0
+        yield event.make_result().message(f"已取消登记比赛 {cid}。")
 
     @filter.command("wg-")
     async def wg_untrack(self, event: AstrMessageEvent, wg_id: str = ""):
