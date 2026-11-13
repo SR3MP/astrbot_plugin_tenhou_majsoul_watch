@@ -122,7 +122,7 @@ def _plugin_data_dir() -> str:
     return path
 
 
-@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.13.6")
+@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.13.7")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)

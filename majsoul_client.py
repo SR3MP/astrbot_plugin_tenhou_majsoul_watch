@@ -197,6 +197,17 @@ def ms_level_up(level_id: int) -> int:
 # 旧的 MS_CATEGORY(category) 因此把几乎所有局都念成"四南銀"。
 _MS_MODE_LABEL = {1: "四東", 2: "四南", 11: "三東", 12: "三南"}
 
+
+def ms_game_is_three(mode: int, player_count: int) -> bool:
+    """这场是三麻还是四麻：GameConfig.mode.mode 为准，缺失时按人数。
+
+    比赛场既有四人赛也有三人赛，不能因为是比赛场就一律取三麻段位。
+    """
+    if mode in (1, 2, 11, 12):
+        return mode in (11, 12)
+    return player_count == 3
+
+
 # GameConfig.meta.mode_id → 段位场。只有这两个是实测锚定的（网页客户端进
 # "玉之间 四人南"页面请求的 filter_id=212，那一版返回的每行 mode_id=12；
 # 216 的每行 mode_id=16 且样本段位全在雀圣以上），其余值还没锚，落回段位推断。
@@ -278,11 +289,17 @@ def ms_record_row(head, contest: str = "") -> dict:
     比赛牌谱的 RecordGame 与 fetchGameRecord 的 head 字段一致，两处共用。
     """
     acc = {a.seat: a for a in head.accounts}
+    cfg = head.config if head.HasField("config") else None
+    mode = cfg.mode.mode if cfg is not None and cfg.HasField("mode") else 0
+    three = ms_game_is_three(mode, len(acc))
     tiers = []
     players = []
     for seat in sorted(acc):
         a = acc[seat]
-        lvl_id = a.level.id
+        # 三麻比赛取 level3，四麻比赛取 level，和 live 行同一口径
+        lvl_id = a.level3.id if three and a.HasField("level3") else 0
+        if not lvl_id:
+            lvl_id = a.level.id if a.HasField("level") else 0
         tiers.append(lvl_id // 100 % 100)
         players.append({
             "seat": seat,
@@ -295,10 +312,11 @@ def ms_record_row(head, contest: str = "") -> dict:
         "uuid": head.uuid,
         "start_time": head.start_time,
         "end_time": head.end_time,
-        "category": head.config.category if head.HasField("config") else 0,
-        "mode": head.config.mode.mode if head.HasField("config") else 0,
-        "field": contest or ms_room_name(head.config if head.HasField("config") else None, tiers),
+        "category": cfg.category if cfg is not None else 0,
+        "mode": mode,
+        "field": contest or ms_room_name(cfg, tiers),
         "players": players,
+        "three": three,
     }
     if contest:
         row["contest"] = contest
@@ -744,7 +762,7 @@ class MahjongSoulClient:
             aid = p.get("account_id") if isinstance(p, dict) else None
             info = self._rank_of(aid) if aid else {}
             if three:
-                # 三麻只认 level3；列表行那列除比赛场外都取 level（四麻），不兜底
+                # 三麻只认 level3；列表行不带 PT，查不到就留空，不用四麻数据顶替
                 out.append(ms_level_text(info.get("rank3") or "",
                                          info.get("pt3"), info.get("max_pt3")))
             else:
@@ -1063,13 +1081,17 @@ class MahjongSoulClient:
 
         contest 非空时是比赛场：场名直接用比赛名（段位推断对比赛没意义）。
         filter_id 是拉这一行时用的场参数，判场比段位推断可靠。
+        段位按这一局的规则取：四人赛用 level，三人赛用 level3；比赛场既可能
+        是四麻也可能是三麻，不能因为是比赛场就一律取 level3。
         """
+        cfg = lv.game_config
+        mode = cfg.mode.mode if cfg.HasField("mode") else 0
+        three = ms_game_is_three(mode, len(lv.players))
         players = []
         tiers = []
         for idx, p in enumerate(lv.players):
-            if contest and p.level3.id:
-                lvl_id = p.level3.id
-            else:
+            lvl_id = p.level3.id if three and p.HasField("level3") else 0
+            if not lvl_id:
                 lvl_id = p.level.id if p.HasField("level") else 0
             tiers.append(lvl_id // 100 % 100)
             players.append({
@@ -1082,13 +1104,14 @@ class MahjongSoulClient:
         row = {
             "uuid": lv.uuid,
             "start_time": lv.start_time,
-            "category": lv.game_config.category,
+            "category": cfg.category,
+            "three": three,
             # GameConfig.mode.mode：1/2/11/12，和 fetchAccountStatisticInfo 里
             # AccountStatisticByGameMode.mode 同一套编号，五个率按它取对应那一档
-            "mode": lv.game_config.mode.mode,
-            "mode_id": lv.game_config.meta.mode_id,
+            "mode": mode,
+            "mode_id": cfg.meta.mode_id,
             "filter_id": filter_id,
-            "field": contest or ms_room_name(lv.game_config, tiers, filter_id),
+            "field": contest or ms_room_name(cfg, tiers, filter_id),
             "players": players,
             "live": True,
         }
@@ -1558,7 +1581,11 @@ class MahjongSoulWatcher:
     def _open_game(self, uuid_str: str, members: list[int], lg: Optional[dict]) -> dict:
         players = list((lg or {}).get("players", []))
         field = (lg or {}).get("field") or "未知场"
-        three = field.startswith("三") or len(players) == 3
+        # live / 牌谱行已按 GameConfig.mode.mode 定好三麻四麻；比赛名以「三」
+        # 开头时按场名猜会错判成三麻，别再用场名兜底。
+        three = (lg or {}).get("three")
+        if three is None:
+            three = len(players) == 3
         start_pt = {}
         for aid in members:
             try:
