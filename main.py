@@ -701,6 +701,25 @@ class TenhouWatch(Star):
             pass
         return ids
 
+    def _focus_names(self, session: str) -> set[str]:
+        """本会话订阅的玩家名（播报加粗用），只认真实订阅名单不猜文案。
+
+        天凤订阅存玩家名；雀魂订阅存 AID，昵称从 watcher 的反查表里取。
+        """
+        names: set[str] = set()
+        sub = self._subs.get(session) or {}
+        for p in (sub.get("players") or ()):
+            if p:
+                names.add(str(p))
+        ms_sub = self._ms_subs.get(session) or {}
+        watching = getattr(self._ms_watcher, "watching", {}) or {}
+        for aid in (ms_sub.get("accounts") or ()):
+            names.add(str(aid))
+            nick = watching.get(aid) or watching.get(str(aid))
+            if nick and str(nick) != str(aid):
+                names.add(str(nick))
+        return names
+
     def _md(self, session: str, text: str, platform_type: str = "") -> str:
         """QQ 官方把 Plain 当 Markdown 发，这里只在 QQ 会话做排版转换。
 
@@ -711,7 +730,7 @@ class TenhouWatch(Star):
             qq = str(session or "").split(":", 1)[0].strip() in self._qq_platform_ids()
         if not qq:
             qq = is_qq_session(session)
-        return md_text(text) if qq else text
+        return md_text(text, self._focus_names(session)) if qq else text
 
     def _maybe_md(self, event, text: str) -> str:
         platform_type = ""

@@ -210,6 +210,19 @@ _ARG_TAG = re.compile(r"<([^<>\n]+)>")
 # 插在行首 # 前，# 就不是行首标记，于是井号原样显示、字号正常。
 _ZWSP = "\u200b"
 
+# 播报（开局/终局/流局/小局结算/回放）带事件标题或座位分隔线，和命令回复
+# 走两套排版：播报做页眉页脚引用 + 统计行引用 + 订阅玩家加粗；命令回复
+# 只把"标题行后紧跟的缩进行"转引用，其余保持基础转义。
+_BROADCAST_TAG = re.compile(r"【(?:对局开始|对局完成|流局|小局结算|牌谱回放)】")
+_STAT = re.compile(r"^顺[\d.]+")          # 五率辅助行：顺2.52 和21.66% …
+_TITLE_LINE = re.compile(
+    r"^(?:天凤订阅|雀魂订阅|天凤跟踪|天凤进行中对局|雀魂跟踪|雀魂进行中对局).*:$"
+    r"|^.+ \(\d+\):$"
+)
+_BOLD_SCORE = re.compile(r"^(.*?) (-?\d+) -> (-?\d+)(（[+-]?\d+）)$")
+_BOLD_RANK = re.compile(r"^(.*?) (\d+(?:\([^)]*\))?)$")
+_BOLD_SEAT = re.compile(r"^(.*?) (\S+ \d+/\d+)$")
+
 
 def is_qq_platform(platform_name: str) -> bool:
     """判断平台**类型**（event.get_platform_name() 的返回值，如 qq_official）。
@@ -229,57 +242,148 @@ def is_qq_session(session: str) -> bool:
     return str(session or "").split(":", 1)[0].strip().lower() in _QQ_PLATFORMS
 
 
-def md_text(text: str) -> str:
+def _esc_line(line: str) -> str:
+    """参数占位符和 Markdown 敏感字符全角化，不改数字和名字。
+
+    <...> 里的真实 URL / <@提及> 不动；[] ~~ * _ 会被 QQ 当链接/删除线/斜体，
+    本插件发的都是纯文本参数说明，全角化后原样显示。
+    """
+    line = _ARG_TAG.sub(
+        lambda m: m.group(0) if m.group(1).startswith(
+            ("http://", "https://", "@")) else f"＜{m.group(1)}＞", line)
+    return (line.replace("[", "［").replace("]", "］")
+                .replace("~~", "～～").replace("*", "＊").replace("_", "＿"))
+
+
+def md_text(text: str, focus=()) -> str:
     """把本插件的纯文本排版转成 QQ 原生 Markdown 友好排版。
 
-    只做结构转换，不改数字和名字：行首 #码 前加零宽空格，避免被当标题放大；
-    ───── → 水平分割线，座位行 → 无序列表，注: → 块引用，
-    单换行 → 空行换行（QQ Markdown 的换行规则）。
+    播报与命令回复分两套：播报做页眉/页脚引用、统计行引用，并只加粗 focus
+    里的订阅玩家；命令回复把"标题行后紧跟的缩进行"转引用。两者都不改文字。
+
+    focus 由调用方按会话订阅名单传入（名字或 AID），其他平台不调用本函数。
     """
     src = str(text or "")
     if not src:
         return src
-    out: list[str] = []
-    in_seats = False
-    for raw in src.split("\n"):
-        line = raw
-        stripped = line.strip()
+    if _BROADCAST_TAG.search(src) or _SEAT_SEP in src:
+        return _md_broadcast(src, focus)
+    return _md_command(src)
+
+
+def _protect_hash(raw: str) -> str:
+    """行首 #码前插零宽空格，井号原样显示、字号正常；缩进行同样保护。"""
+    stripped = raw.strip()
+    if stripped.startswith("#"):
+        lead = len(raw) - len(raw.lstrip())
+        return raw[:lead] + _ZWSP + raw[lead:]
+    return raw
+
+
+def _bold_focus(line: str, focus) -> str:
+    """给订阅玩家的名字本身加粗（只加第一次，避免结果列重复加粗）。"""
+    for n in focus:
+        n = str(n or "").strip()
+        if n and n in line and f"**{n}**" not in line:
+            line = line.replace(n, f"**{n}**", 1)
+    return line
+
+
+def _bold_result(line: str, focus) -> str:
+    """订阅玩家所在行，加粗其结果数字；其他人的数字保持普通文本。"""
+    if not any(str(n or "") in line for n in focus):
+        return line
+    m = _BOLD_SCORE.match(line)          # 名字 24000 -> 27000（+3000）
+    if m:
+        return f"{m.group(1)} {m.group(2)} -> **{m.group(3)}{m.group(4)}**"
+    m = _BOLD_RANK.match(line)           # 名字 30600(131) / 雀圣三 3099/9000
+    if m:
+        return f"{m.group(1)} **{m.group(2)}**"
+    m = _BOLD_SEAT.match(line)           # 名字 雀豪一 1496/2800
+    if m:
+        return f"{m.group(1)} **{m.group(2)}**"
+    return line
+
+
+def _md_broadcast(text: str, focus) -> str:
+    """播报专用排版：页眉/页脚引用、统计行引用、只加粗订阅玩家。"""
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    # 文案位置：把标题行提到最前（终局的点评在标题前、开局的"正在乱杀"在标题前）
+    for i, ln in enumerate(lines):
+        if "【对局完成】" in ln and i > 0:
+            lines[0], lines[i] = lines[i], lines[0]
+            break
+    for i, ln in enumerate(lines):
+        if "【对局开始】" in ln and i > 0:
+            lines[0], lines[i] = lines[i], lines[0]
+            break
+    # 观战指令抽出来，最后放到末尾页脚
+    instr = [ln for ln in lines if ln.startswith("实时观战输入 ")]
+    lines = [ln for ln in lines if not ln.startswith("实时观战输入 ")]
+
+    parts: list[str] = []
+    for raw in lines:
+        stripped = raw.strip()
         if stripped == _SEAT_SEP:
-            in_seats = not in_seats
-            out.append("***")
+            parts.append("***")
             continue
-        # 行首 #码（如 #ma27f）在 QQ 里会被当标题：井号被吃掉、文字放大。
-        # 在第一个 # 前插零宽空格，# 就不再是行首标记，井号原样显示、字号正常。
-        # 缩进行（比赛列表的 "  #m6484"）同样要保护，去掉前导空白后再判断。
-        if stripped.startswith("#"):
-            lead = len(line) - len(line.lstrip())
-            line = line[:lead] + _ZWSP + line[lead:]
-        if stripped.startswith(_NOTE_MARK):
-            out.append("> " + line.lstrip())
+        parts.append(_esc_line(_protect_hash(raw)))
+
+    out: list[str] = []
+    for i, part in enumerate(parts):
+        if i == 0:
+            out.extend(["> " + part, "***"])          # 页眉：引用 + 横线
             continue
-        if stripped.startswith("【对局完成】"):
-            out.append("**【对局完成】**" + stripped[len("【对局完成】"):])
+        if part.startswith(_NOTE_MARK):
+            out.extend(["***", "> " + part])          # 注页脚
             continue
-        if in_seats and stripped:
-            line = "- " + line.lstrip()
-        # 参数占位符 <AID|昵称|$AID> 的尖括号换成全角，避免被当自动链接吞掉内容
-        line = _ARG_TAG.sub(
-            lambda m: m.group(0) if m.group(1).startswith(
-                ("http://", "https://", "@")) else f"＜{m.group(1)}＞", line)
-        # 名字/帮助里的 Markdown 标记换成全角，避免被当链接/斜体/删除线解析：
-        # [码] 会被当链接标记，~~ *_ 会被当删除线/加粗/斜体。
-        # 本插件发送的全是纯文本参数说明，没有任何一处需要真的渲染成链接。
-        line = (line.replace("[", "［").replace("]", "］")
-                    .replace("~~", "～～").replace("*", "＊").replace("_", "＿"))
-        out.append(line)
-    # 相邻的列表项/引用行用单换行，段落之间空行（QQ Markdown 靠空行换行）
+        part = _bold_result(_bold_focus(part, focus), focus)
+        if _STAT.match(part):
+            out.append("> " + part)                   # 五率行：引用降权
+        else:
+            out.append(part)
+    if instr:
+        while out and out[-1] == "***":
+            out.pop()
+        out.extend(["***", "> " + _esc_line(instr[0])])  # 观战指令页脚
+    return "\n\n".join(out)
+
+
+def _md_command(text: str) -> str:
+    """命令回复排版：标题行后紧跟的缩进行转引用，其余保持基础转义。"""
+    tagged: list[tuple[str, str]] = []
+    in_quote = False
+    for raw in text.split("\n"):
+        stripped = raw.strip()
+        is_title = bool(_TITLE_LINE.match(stripped))
+        is_indent = raw.startswith("  ") and bool(stripped)
+        if is_title:
+            tagged.append(("title", raw))
+            in_quote = True
+            continue
+        if in_quote and is_indent:
+            tagged.append(("quote", raw))
+            continue
+        if not stripped:
+            tagged.append(("blank", raw))
+            continue
+        in_quote = False
+        tagged.append(("text", raw))
+
+    out: list[str] = []
+    for kind, raw in tagged:
+        if kind == "blank":
+            out.append("")
+            continue
+        conv = _esc_line(_protect_hash(raw))
+        out.append("> " + conv.lstrip() if kind == "quote" else conv)
+
     parts: list[str] = []
     prev = ""
     for line in out:
-        cur = "list" if line.startswith("- ") else (
-              "quote" if line.startswith("> ") else "text")
+        cur = "quote" if line.startswith("> ") else "text"
         if parts:
-            parts.append("\n" if cur == prev and cur != "text" else "\n\n")
+            parts.append("\n" if cur == prev == "quote" else "\n\n")
         parts.append(line)
         prev = cur
     return "".join(parts)
