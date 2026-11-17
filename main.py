@@ -46,7 +46,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
 from .tenhou_client import LogReplayParser
-from .broadcast import now_hm, start_text
+from .broadcast import now_hm, start_text, is_qq_session, md_text
 from .th_live import (
     ThGameSession,
     ThWatcher,
@@ -682,7 +682,18 @@ class TenhouWatch(Star):
     PUSH_TRIES = 36
     PUSH_RETRY_WAIT = 5.0
 
+    def _md(self, session: str, text: str) -> str:
+        """QQ 官方把 Plain 当 Markdown 发，这里只在 QQ 会话做排版转换。"""
+        return md_text(text) if is_qq_session(session) else text
+
+    def _maybe_md(self, event, text: str) -> str:
+        return self._md(str(event.session), text)
+
+    def _reply(self, event, text: str):
+        return event.make_result().message(self._maybe_md(event, text))
+
     async def _push(self, session: str, text: str) -> None:
+        text = self._md(session, text)
         err = ""
         for i in range(self.PUSH_TRIES):
             try:
@@ -1060,7 +1071,7 @@ class TenhouWatch(Star):
     @filter.command("wghelp")
     async def wghelp(self, event: AstrMessageEvent):
         """wghelp：打印全部指令的用法清单。"""
-        yield event.make_result().message(HELP_TEXT)
+        yield self._reply(event, HELP_TEXT)
 
     # ==================================================================
     #  指令: wgls
@@ -1107,7 +1118,7 @@ class TenhouWatch(Star):
             err = self._ms_client.last_error or "尚未完成登录"
             lines.append(f"（雀魂未登录：{err}。账号已配置，会自动重试；也可发 wgstat 看状态）")
 
-        yield event.make_result().message("\n".join(lines))
+        yield self._reply(event, "\n".join(lines))
 
     # ==================================================================
     #  指令: thadd / thdel / thfilter
@@ -1117,21 +1128,21 @@ class TenhouWatch(Star):
         """thadd <玩家名>：订阅天凤玩家，他开局/散场时本群自动播一条。"""
         player_id = (player_id or "").strip()
         if not player_id:
-            yield event.make_result().message("用法: thadd <玩家名>\n示例: thadd 张三")
+            yield self._reply(event, "用法: thadd <玩家名>\n示例: thadd 张三")
             return
         session = str(event.session)
         sub = self._get_sub(session)
         sub["players"].add(player_id)
         self._th_sync_watcher()
         self._save_state()
-        yield event.make_result().message(f"已订阅天凤ID: {player_id}")
+        yield self._reply(event, f"已订阅天凤ID: {player_id}")
 
     @filter.command("thdel")
     async def thdel(self, event: AstrMessageEvent, player_id: str = ""):
         """thdel <玩家名>：取消订阅这个天凤玩家。"""
         player_id = (player_id or "").strip()
         if not player_id:
-            yield event.make_result().message("用法: thdel <玩家名>")
+            yield self._reply(event, "用法: thdel <玩家名>")
             return
         session = str(event.session)
         sub = self._get_sub(session)
@@ -1139,9 +1150,9 @@ class TenhouWatch(Star):
             sub["players"].discard(player_id)
             self._th_sync_watcher()
             self._save_state()
-            yield event.make_result().message(f"已删除订阅: {player_id}")
+            yield self._reply(event, f"已删除订阅: {player_id}")
         else:
-            yield event.make_result().message(f"未找到订阅: {player_id}")
+            yield self._reply(event, f"未找到订阅: {player_id}")
 
     @filter.command("thfilter")
     async def thfilter(self, event: AstrMessageEvent, rest: GreedyStr):
@@ -1151,7 +1162,7 @@ class TenhouWatch(Star):
         sub = self._get_sub(session)
         if not args:
             current = ", ".join(sub["filters"]) if sub["filters"] else "不限"
-            yield event.make_result().message(
+            yield self._reply(event,
                 f"当前天凤筛选: {current}\n"
                 "用法: thfilter <场名关键字> [关键字...]\n"
                 "按场名子串匹配，如: thfilter 鳳南 鳳東\n"
@@ -1161,11 +1172,11 @@ class TenhouWatch(Star):
         if args[0].lower() in ("all", "不限", "无"):
             sub["filters"] = []
             self._save_state()
-            yield event.make_result().message("天凤筛选已清空。")
+            yield self._reply(event, "天凤筛选已清空。")
             return
         sub["filters"] = list(args)
         self._save_state()
-        yield event.make_result().message(f"天凤筛选已设为: {', '.join(args)}")
+        yield self._reply(event, f"天凤筛选已设为: {', '.join(args)}")
 
     # ==================================================================
     #  指令: msadd / msdel / msfilter / mspt
@@ -1175,7 +1186,7 @@ class TenhouWatch(Star):
         """msadd <AID|昵称> 或 msadd $<AID>：订阅雀魂玩家，他开局/散场时本群自动播一条。"""
         player_id = (player_id or "").strip()
         if not player_id:
-            yield event.make_result().message(
+            yield self._reply(event,
                 "用法: msadd <AID> / $<AID> / <昵称>\n"
                 "示例: msadd 12345678 / msadd $123456 / msadd 张三"
             )
@@ -1199,13 +1210,13 @@ class TenhouWatch(Star):
                     found = await asyncio.to_thread(
                         self._ms_client.lookup_player, None, raw)
                     if not found.get("account_id"):
-                        yield event.make_result().message(
+                        yield self._reply(event,
                             f"未找到玩家: {player_id}\n{self._ms_nick_hint()}")
                         return
                     account_id = found["account_id"]
                     nickname = found.get("nickname", raw)
                 except Exception as e:
-                    yield event.make_result().message(f"雀魂查询失败: {e}")
+                    yield self._reply(event, f"雀魂查询失败: {e}")
                     return
             else:
                 cands = await asyncio.to_thread(
@@ -1219,10 +1230,10 @@ class TenhouWatch(Star):
                         lvl = ms_level_text(c["rank"], c["pt"], c["max_pt"]) or c["rank"]
                         lines.append(f"{i}. {c['nickname']} | {lvl} | AID {c['account_id']}")
                     lines.append("请用 msadd $<AID> 订阅指定账号。")
-                    yield event.make_result().message("\n".join(lines))
+                    yield self._reply(event, "\n".join(lines))
                     return
                 else:
-                    yield event.make_result().message(
+                    yield self._reply(event,
                         f"未找到玩家: {player_id}\n{self._ms_nick_hint()}")
                     return
 
@@ -1233,7 +1244,7 @@ class TenhouWatch(Star):
                     self._ms_client.lookup_player, account_id, None)
                 nickname = info.get("nickname", "")
             except Exception as e:
-                yield event.make_result().message(f"雀魂查询失败: {e}")
+                yield self._reply(event, f"雀魂查询失败: {e}")
                 return
 
         ms_sub["accounts"].add(account_id)
@@ -1241,14 +1252,14 @@ class TenhouWatch(Star):
         self._save_state()
 
         label = f"{account_id}" + (f"（{nickname}）" if nickname else "")
-        yield event.make_result().message(f"已订阅雀魂AID: {label}")
+        yield self._reply(event, f"已订阅雀魂AID: {label}")
 
     @filter.command("msdel")
     async def msdel(self, event: AstrMessageEvent, player_id: str = ""):
         """msdel <AID|昵称> 或 $<AID>：取消订阅这个雀魂玩家（重名时需用 $<AID> 指定）。"""
         player_id = (player_id or "").strip()
         if not player_id:
-            yield event.make_result().message(
+            yield self._reply(event,
                 "用法: msdel <AID> / $<AID> / <昵称>\n"
                 "示例: msdel 12345678 / msdel $123456 / msdel 张三"
             )
@@ -1264,7 +1275,7 @@ class TenhouWatch(Star):
             hits = [a for a in ms_sub["accounts"]
                     if self._ms_watcher.watching.get(a) == raw]
             if len(hits) > 1:
-                yield event.make_result().message(
+                yield self._reply(event,
                     f"昵称「{raw}」在本群订阅里重名: "
                     + " ".join(f"${a}" for a in sorted(hits))
                     + "\n请用 msdel $<AID> 指定要删除的账号。"
@@ -1278,7 +1289,7 @@ class TenhouWatch(Star):
                                                 None, raw)
                 account_id = found.get("account_id")
                 if not account_id:
-                    yield event.make_result().message(f"未找到雀魂订阅: {player_id}")
+                    yield self._reply(event, f"未找到雀魂订阅: {player_id}")
                     return
         if account_id in ms_sub["accounts"]:
             label = self._ms_watcher.watching.get(account_id) or str(account_id)
@@ -1289,9 +1300,9 @@ class TenhouWatch(Star):
                 # 别的群还订着同一个账号时不能停监控
                 self._ms_watcher.remove(account_id)
             self._save_state()
-            yield event.make_result().message(f"已删除雀魂订阅: {label}")
+            yield self._reply(event, f"已删除雀魂订阅: {label}")
         else:
-            yield event.make_result().message(
+            yield self._reply(event,
                 f"未找到雀魂订阅: {self._ms_watcher.watching.get(account_id) or account_id}")
 
     @filter.command("msfilter")
@@ -1302,7 +1313,7 @@ class TenhouWatch(Star):
         ms_sub = self._get_ms_sub(session)
         if not args:
             current = ", ".join(ms_sub["filters"]) if ms_sub["filters"] else "不限"
-            yield event.make_result().message(
+            yield self._reply(event,
                 f"当前雀魂筛选: {current}\n"
                 "用法: msfilter <场名关键字> [关键字...]\n"
                 "按场名子串匹配，如: msfilter 金 玉 王座\n"
@@ -1312,18 +1323,18 @@ class TenhouWatch(Star):
         if [a.lower() for a in args] == ["all"] or list(args) == ["不限"]:
             ms_sub["filters"] = []
             self._save_state()
-            yield event.make_result().message("雀魂筛选已清空。")
+            yield self._reply(event, "雀魂筛选已清空。")
             return
         ms_sub["filters"] = list(args)
         self._save_state()
-        yield event.make_result().message(f"雀魂筛选已设为: {', '.join(args)}")
+        yield self._reply(event, f"雀魂筛选已设为: {', '.join(args)}")
 
     @filter.command("mspt")
     async def mspt(self, event: AstrMessageEvent, player_id: str = ""):
         """mspt <AID|昵称> 或 $<AID>：查雀魂段位和 PT；未登录时按昵称走牌谱屋，重名会列候选。"""
         player_id = (player_id or "").strip()
         if not player_id:
-            yield event.make_result().message(
+            yield self._reply(event,
                 "用法: mspt <AID> / $<AID> / <昵称>\n"
                 "示例: mspt 12345678 / mspt $123456 / mspt 张三"
             )
@@ -1340,7 +1351,7 @@ class TenhouWatch(Star):
                 cands = await asyncio.to_thread(
                     self._ms_client.koromo_search_candidates, raw)
                 if len(cands) == 1:
-                    yield event.make_result().message(ms_format_pt(cands[0]))
+                    yield self._reply(event, ms_format_pt(cands[0]))
                     return
                 if len(cands) > 1:
                     lines = [f"昵称「{raw}」命中 {len(cands)} 个账号（牌谱屋无法区分服务器，可能含非国服）:"]
@@ -1352,7 +1363,7 @@ class TenhouWatch(Star):
                             row += f" | 三人 {lvl3}"
                         lines.append(row + f" | AID {c['account_id']}")
                     lines.append("请用 mspt <AID> 查询指定账号，或 msadd $<AID> 直接订阅。")
-                    yield event.make_result().message("\n".join(lines))
+                    yield self._reply(event, "\n".join(lines))
                     return
                 # 0 条：继续走 lookup_player 兜底（可能命中观战列表）
 
@@ -1360,20 +1371,20 @@ class TenhouWatch(Star):
                 self._ms_client.lookup_player, account_id, raw)
             if not stats:
                 if account_id is not None and not logged_in:
-                    yield event.make_result().message(
+                    yield self._reply(event,
                         "未登录时无法按 AID 查询。\n"
                         "请在插件配置里填写雀魂账号，或改用昵称: mspt <昵称>"
                     )
                     return
                 if account_id is None:
-                    yield event.make_result().message(
+                    yield self._reply(event,
                         f"未找到玩家: {player_id}\n{self._ms_nick_hint()}")
                     return
-                yield event.make_result().message(f"未找到玩家: {player_id}")
+                yield self._reply(event, f"未找到玩家: {player_id}")
                 return
-            yield event.make_result().message(ms_format_pt(stats))
+            yield self._reply(event, ms_format_pt(stats))
         except Exception as e:
-            yield event.make_result().message(f"雀魂查询失败: {e}")
+            yield self._reply(event, f"雀魂查询失败: {e}")
 
     # ==================================================================
     #  指令: wgstat
@@ -1439,7 +1450,7 @@ class TenhouWatch(Star):
         if not self._ms_watcher.record_detail:
             lines.append("雀魂牌谱权限: 不可用")
 
-        yield event.make_result().message("\n".join(lines))
+        yield self._reply(event, "\n".join(lines))
 
     # ==================================================================
     #  指令: wg <WGID> / wg- / wginfo / wglog
@@ -1543,7 +1554,7 @@ class TenhouWatch(Star):
                     lines.append(
                         f"  无（订阅: {' '.join(players)}，仅查段位房且受筛选限制）"
                     )
-            yield event.make_result().message("\n".join(lines))
+            yield self._reply(event, "\n".join(lines))
             return
 
         # 大厅码有两种写法：L0000 / C0000xxxx 这种带字母的，和 1~5 位数字房号。
@@ -1562,25 +1573,25 @@ class TenhouWatch(Star):
         if is_ms_short:
             async for text in self._ms_begin(
                     session, await self._ms_games_for_mid(arg.lower()), arg.lower()):
-                yield event.make_result().message(text)
+                yield self._reply(event, text)
             return
 
         hits = await self._th_games_for_mid(arg.lower()) if is_short else []
 
         if is_short and hits:
             if len(hits) > 1:
-                yield event.make_result().message(
+                yield self._reply(event,
                     f"四位码 {arg.lower()} 对应 {len(hits)} 场对局，未开始跟踪。"
                     "改用完整 WG 码:\n"
                     + "\n".join(f"  wg {g['wg']}" for g in hits)
                 )
                 return
             async for text in self._wg_begin(session, hits[0]):
-                yield event.make_result().message(text)
+                yield self._reply(event, text)
             return
 
         if is_short and not (is_lobby_word or is_lobby_num):
-            yield event.make_result().message(
+            yield self._reply(event,
                 "未定位到天凤对局，未开始跟踪。可用 wg 列出可跟踪对局。"
             )
             return
@@ -1588,7 +1599,7 @@ class TenhouWatch(Star):
         # 雀魂完整 uuid（250927-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）
         if re.fullmatch(r"\d{6}-[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", arg):
             async for text in self._ms_begin(session, await self._ms_games_for_uuid(arg)):
-                yield event.make_result().message(text)
+                yield self._reply(event, text)
             return
 
         if is_token:
@@ -1596,7 +1607,7 @@ class TenhouWatch(Star):
             await self._th_recent_games()
             game = self._th_find_by_wg(wg_id)
             async for text in self._wg_begin(session, game, wg_id):
-                yield event.make_result().message(text)
+                yield self._reply(event, text)
             return
 
         if is_lobby_word or is_lobby_num:
@@ -1607,37 +1618,37 @@ class TenhouWatch(Star):
                 games = await self._th_recent_games(force=True)
             hits = self._th_match(session, games)
             if not hits:
-                yield event.make_result().message(
+                yield self._reply(event,
                     f"大厅 {lb} 没有匹配的进行中对局。只匹配订阅玩家且通过筛选的对局。\n"
                     "可用 wg <四位码> 指定，或 thadd <玩家名> 订阅玩家。"
                 )
                 return
             if len(hits) > 1:
-                yield event.make_result().message(
+                yield self._reply(event,
                     f"大厅 {lb} 命中 {len(hits)} 场，请指定其一:\n"
                     + "\n".join(self._th_hit_lines(hits))
                 )
                 return
             async for text in self._wg_begin(session, hits[0]):
-                yield event.make_result().message(text)
+                yield self._reply(event, text)
             return
 
         # 玩家名
         hits = self._th_match(session, await self._th_recent_games(), name=arg)
         if not hits:
-            yield event.make_result().message(
+            yield self._reply(event,
                 f"未找到「{arg}」正在进行的对局。天凤昵称区分大小写。\n"
                 "也可用 wg <四位码|8位WG码|大厅码> 指定。"
             )
             return
         if len(hits) > 1:
-            yield event.make_result().message(
+            yield self._reply(event,
                 f"「{arg}」有 {len(hits)} 场进行中，请指定其一:\n"
                 + "\n".join(self._th_hit_lines(hits))
             )
             return
         async for text in self._wg_begin(session, hits[0]):
-            yield event.make_result().message(text)
+            yield self._reply(event, text)
 
     @filter.command("msls")
     async def ms_live_list(self, event: AstrMessageEvent, arg: str = ""):
@@ -1653,7 +1664,7 @@ class TenhouWatch(Star):
             if not contest:
                 contest = await self._ms_contest_games(unique_id=arg)
             if not contest:
-                yield event.make_result().message(
+                yield self._reply(event,
                     f"比赛号 {arg} 未查到对局。比赛号是客户端里的数字 ID，"
                     "且只列本账号参加过的比赛。")
                 return
@@ -1661,7 +1672,7 @@ class TenhouWatch(Star):
             contest = await self._ms_contest_games(force=True)
         if not ranked and not contest:
             err = self._ms_client.last_error or "未登录/列表为空"
-            yield event.make_result().message(
+            yield self._reply(event,
                 f"未拉到雀魂直播列表（{err}）。\n"
                 "订阅的玩家开局仍会自动播报。"
             )
@@ -1718,7 +1729,7 @@ class TenhouWatch(Star):
         lines.append("wg m<四位码> 开始跟踪，wg- m<四位码> 取消。")
         if note:
             lines.append(note)
-        yield event.make_result().message("\n".join(lines))
+        yield self._reply(event, "\n".join(lines))
 
     def _ms_register_contest(self, sub: dict, cid: int) -> str:
         """msls <比赛号> 查到对局后登记这个比赛场，返回给用户的提示语。"""
@@ -1737,28 +1748,28 @@ class TenhouWatch(Star):
         """msaddc <比赛号>：登记比赛场，wg 可跟踪，订阅玩家在该场开局会播报。"""
         cid = (contest_id or "").strip().lstrip("#")
         if not cid.isdigit():
-            yield event.make_result().message(
+            yield self._reply(event,
                 "用法: msaddc <比赛号>\n"
                 "比赛号是雀魂比赛页里的数字，可先用 msls <比赛号> 确认能查到对局")
             return
         session = str(event.session)
         reg = self._get_ms_sub(session).setdefault("contests", [])
         if int(cid) in reg:
-            yield event.make_result().message(f"比赛 {cid} 已在登记中。")
+            yield self._reply(event, f"比赛 {cid} 已在登记中。")
             return
         if len(self._ms_contest_ids()) >= MS_CONTEST_LIMIT:
-            yield event.make_result().message(
+            yield self._reply(event,
                 f"最多同时登记 {MS_CONTEST_LIMIT} 场比赛，先用 msdelc 取消不用的。")
             return
         if not await asyncio.to_thread(self._ms_client.ensure_connection):
-            yield event.make_result().message(
+            yield self._reply(event,
                 "雀魂未登录，无法校验比赛号：" + (self._ms_client.last_error or "原因未知"))
             return
         try:
             rows = await asyncio.to_thread(
                 self._ms_client.get_contest_rows, 3, int(cid))
         except Exception as e:
-            yield event.make_result().message(f"比赛 {cid} 查询失败: {e}")
+            yield self._reply(event, f"比赛 {cid} 查询失败: {e}")
             return
         reg.append(int(cid))
         self._save_state()
@@ -1775,24 +1786,24 @@ class TenhouWatch(Star):
         else:
             lines.append("当前没有进行中的对局。")
         lines.append("订阅玩家在该场开局会播报；也可 wg m<四位码> 手动跟踪。")
-        yield event.make_result().message("\n".join(lines))
+        yield self._reply(event, "\n".join(lines))
 
     @filter.command("msdelc")
     async def msdel_contest(self, event: AstrMessageEvent, contest_id: str = ""):
         """msdelc <比赛号>：取消登记的比赛场。"""
         cid = (contest_id or "").strip().lstrip("#")
         if not cid.isdigit():
-            yield event.make_result().message("用法: msdelc <比赛号>")
+            yield self._reply(event, "用法: msdelc <比赛号>")
             return
         reg = self._get_ms_sub(str(event.session)).setdefault("contests", [])
         if int(cid) not in reg:
-            yield event.make_result().message(f"比赛 {cid} 没有登记。")
+            yield self._reply(event, f"比赛 {cid} 没有登记。")
             return
         reg.remove(int(cid))
         self._save_state()
         self._ms_contest_reg = None
         self._ms_contest_reg_at = 0.0
-        yield event.make_result().message(f"已取消登记比赛 {cid}。")
+        yield self._reply(event, f"已取消登记比赛 {cid}。")
 
     @filter.command("wg-")
     async def wg_untrack(self, event: AstrMessageEvent, wg_id: str = ""):
@@ -1804,7 +1815,7 @@ class TenhouWatch(Star):
         ms_sess = self._ms_sessions.get(session) or {}
         wg_id = (wg_id or "").strip()
         if not sess and not ms_sess:
-            yield event.make_result().message("当前未跟踪任何对局。")
+            yield self._reply(event, "当前未跟踪任何对局。")
             return
         if not wg_id:
             for s in sess.values():
@@ -1813,7 +1824,7 @@ class TenhouWatch(Star):
                 s.stop()
             self._th_sessions.pop(session, None)
             self._ms_sessions.pop(session, None)
-            yield event.make_result().message(
+            yield self._reply(event,
                 f"已取消全部跟踪（天凤{len(sess)} 场、雀魂{len(ms_sess)} 场）。")
             return
         key = wg_id.lower()
@@ -1823,11 +1834,11 @@ class TenhouWatch(Star):
                 ms_sess.pop(mid, None)
                 if not ms_sess:
                     self._ms_sessions.pop(session, None)
-                yield event.make_result().message(f"已取消跟踪 #{mid}（雀魂）。")
+                yield self._reply(event, f"已取消跟踪 #{mid}（雀魂）。")
                 return
         target = self._th_pick(sess, wg_id)
         if not target:
-            yield event.make_result().message(
+            yield self._reply(event,
                 f"未找到跟踪中的对局: {wg_id}\n当前: "
                 + ", ".join(list(sess.keys()) + list(ms_sess.keys()))
             )
@@ -1836,7 +1847,7 @@ class TenhouWatch(Star):
         sess.pop(target)
         if not sess:
             self._th_sessions.pop(session, None)
-        yield event.make_result().message(f"已取消跟踪 #{target}（天凤）。")
+        yield self._reply(event, f"已取消跟踪 #{target}（天凤）。")
 
     @filter.command("wgon")
     async def wgon(self, event: AstrMessageEvent, level: str = ""):
@@ -1848,17 +1859,17 @@ class TenhouWatch(Star):
         if level == "0":
             sub["enabled"] = True
             ms_sub["enabled"] = True
-            yield event.make_result().message("推送已全部启用")
+            yield self._reply(event, "推送已全部启用")
         elif level == "1":
             sub["enabled"] = True
-            yield event.make_result().message("天凤推送已启用")
+            yield self._reply(event, "天凤推送已启用")
         elif level == "2":
             ms_sub["enabled"] = True
-            yield event.make_result().message("雀魂推送已启用")
+            yield self._reply(event, "雀魂推送已启用")
         else:
             sub["enabled"] = True
             ms_sub["enabled"] = True
-            yield event.make_result().message("推送已全部启用")
+            yield self._reply(event, "推送已全部启用")
         self._save_state()
 
     @filter.command("wgoff")
@@ -1870,17 +1881,17 @@ class TenhouWatch(Star):
         if level == "0":
             sub["enabled"] = False
             ms_sub["enabled"] = False
-            yield event.make_result().message("推送已全部禁用")
+            yield self._reply(event, "推送已全部禁用")
         elif level == "1":
             sub["enabled"] = False
-            yield event.make_result().message("天凤推送已禁用")
+            yield self._reply(event, "天凤推送已禁用")
         elif level == "2":
             ms_sub["enabled"] = False
-            yield event.make_result().message("雀魂推送已禁用")
+            yield self._reply(event, "雀魂推送已禁用")
         else:
             sub["enabled"] = False
             ms_sub["enabled"] = False
-            yield event.make_result().message("推送已全部禁用")
+            yield self._reply(event, "推送已全部禁用")
         self._save_state()
 
     @filter.command("wginfo")
@@ -1892,25 +1903,25 @@ class TenhouWatch(Star):
         sess = self._th_sessions.get(session) or {}
         ms_sess = self._ms_sessions.get(session) or {}
         if not sess and not ms_sess:
-            yield event.make_result().message("当前未跟踪任何对局，无法查询比分。")
+            yield self._reply(event, "当前未跟踪任何对局，无法查询比分。")
             return
         wg_id = (wg_id or "").strip()
         if wg_id:
             key = wg_id.lower()
             for mid, s in ms_sess.items():
                 if mid == key or s.uuid.lower() == key:
-                    yield event.make_result().message(s.brief())
+                    yield self._reply(event, s.brief())
                     return
             target = self._th_pick(sess, wg_id)
             if not target:
-                yield event.make_result().message(
+                yield self._reply(event,
                     f"未找到跟踪中的对局: {wg_id}\n当前: "
                     + ", ".join(list(sess.keys()) + list(ms_sess.keys()))
                 )
                 return
-            yield event.make_result().message(sess[target].brief())
+            yield self._reply(event, sess[target].brief())
             return
-        yield event.make_result().message(
+        yield self._reply(event,
             "\n".join([s.brief() for s in sess.values()]
                       + [s.brief() for s in ms_sess.values()])
         )
@@ -1920,14 +1931,14 @@ class TenhouWatch(Star):
         """wglog <牌谱码或链接>：查那局天凤牌谱，逐局回放和了/流局与各家点数。"""
         code = (code or "").strip()
         if not code:
-            yield event.make_result().message(
+            yield self._reply(event,
                 "用法: wglog <牌谱码或链接>\n"
                 "示例: wglog 2024010100gm-0000-0000-00000000"
             )
             return
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, LogReplayParser(code).parse)
-        yield event.make_result().message(result)
+        yield self._reply(event, result)
 
     async def terminate(self):
         # 热重载时旧实例的登录/补昵称任务要停掉，否则它会继续退避重试并刷日志

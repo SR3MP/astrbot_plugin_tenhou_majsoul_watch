@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import re
 import time
 
 _MAX_HEADLINES = 2
@@ -193,3 +194,66 @@ def finish_text(mid: str, rows, focus=(), notes=()) -> str:
         pts = fmt_num(r[1])
         lines.append(f"{r[0]} {pts}({tail})" if tail else f"{r[0]} {pts}")
     return "\n".join(lines + extra_notes)
+
+
+# ---- QQ 官方 Markdown 适配 -------------------------------------------
+# AstrBot 的 qqofficial 适配器把 Plain 原样塞进 markdown.content（msg_type=2），
+# 纯文本排版在 QQ 上会被 Markdown 重新解释：行首 # 变标题、单换行被合并、
+# ───── 不是分割线。下面这组转换只在 QQ 官方会话启用，其他平台保持原文。
+
+_QQ_PLATFORMS = {"qqofficial", "qq_official"}
+_CODE_LINE = re.compile(r"^(\s*)#(m?[0-9a-f]{4})(?=\W|$)(.*)$", re.I)
+_NOTE_MARK = ("注:", "注：")
+
+
+def is_qq_session(session: str) -> bool:
+    """unified_msg_origin 的前缀就是平台 ID（形如 qqofficial:GroupMessage:...）。"""
+    return str(session or "").split(":", 1)[0].strip().lower() in _QQ_PLATFORMS
+
+
+def md_text(text: str) -> str:
+    """把本插件的纯文本排版转成 QQ 原生 Markdown 友好排版。
+
+    只做结构转换，不改数字和名字：#码 → 二级标题（缩进行 → 列表项），
+    ───── → 水平分割线，座位行 → 无序列表，注: → 块引用，
+    单换行 → 空行换行（QQ Markdown 的换行规则）。
+    """
+    src = str(text or "")
+    if not src:
+        return src
+    out: list[str] = []
+    in_seats = False
+    for raw in src.split("\n"):
+        line = raw
+        stripped = line.strip()
+        if stripped == _SEAT_SEP:
+            in_seats = not in_seats
+            out.append("***")
+            continue
+        m = _CODE_LINE.match(line)
+        if m:
+            lead, code, tail = m.groups()
+            out.append(f"- {code}{tail}" if lead else f"## {code}{tail}")
+            continue
+        if stripped.startswith(_NOTE_MARK):
+            out.append("> " + line.lstrip())
+            continue
+        if stripped.startswith("【对局完成】"):
+            out.append("**【对局完成】**" + stripped[len("【对局完成】"):])
+            continue
+        if in_seats and stripped:
+            line = "- " + line.lstrip()
+        # 名字里若带 Markdown 标记，换成全角，避免被渲染成斜体/删除线
+        line = line.replace("~~", "～～").replace("*", "＊").replace("_", "＿")
+        out.append(line)
+    # 相邻的列表项/引用行用单换行，段落之间空行（QQ Markdown 靠空行换行）
+    parts: list[str] = []
+    prev = ""
+    for line in out:
+        cur = "list" if line.startswith("- ") else (
+              "quote" if line.startswith("> ") else "text")
+        if parts:
+            parts.append("\n" if cur == prev and cur != "text" else "\n\n")
+        parts.append(line)
+        prev = cur
+    return "".join(parts)
