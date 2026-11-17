@@ -201,20 +201,38 @@ def finish_text(mid: str, rows, focus=(), notes=()) -> str:
 # 纯文本排版在 QQ 上会被 Markdown 重新解释：行首 # 变标题、单换行被合并、
 # ───── 不是分割线。下面这组转换只在 QQ 官方会话启用，其他平台保持原文。
 
-_QQ_PLATFORMS = {"qqofficial", "qq_official"}
-_CODE_LINE = re.compile(r"^(\s*)#(m?[0-9a-f]{4})(?=\W|$)(.*)$", re.I)
+_QQ_PLATFORMS = {"qqofficial", "qq_official", "qq_official_webhook"}
 _NOTE_MARK = ("注:", "注：")
+# <...> 在 QQ Markdown 里是自动链接/HTML 标记，参数占位符会被吞（$AID→AID）。
+# 换成全角尖括号即可保留原意；真实 URL 与 <@提及> 不动。
+_ARG_TAG = re.compile(r"<([^<>\n]+)>")
+# 零宽空格：QQ 把它当正文字符保留（文档用它撑开空行），且完全不可见。
+# 插在行首 # 前，# 就不是行首标记，于是井号原样显示、字号正常。
+_ZWSP = "\u200b"
+
+
+def is_qq_platform(platform_name: str) -> bool:
+    """判断平台**类型**（event.get_platform_name() 的返回值，如 qq_official）。
+
+    AstrBot 的 unified_msg_origin 前缀是平台**实例名**（用户自定义，如「虎皮A梦」），
+    不是类型名，所以不能靠会话前缀判断是不是 QQ 官方。这里按类型判断才可靠。
+    """
+    return str(platform_name or "").strip().lower() in _QQ_PLATFORMS
 
 
 def is_qq_session(session: str) -> bool:
-    """unified_msg_origin 的前缀就是平台 ID（形如 qqofficial:GroupMessage:...）。"""
+    """按 unified_msg_origin 前缀判断（仅在拿不到平台类型时的兜底）。
+
+    能匹配标准平台 ID（qqofficial/qq_official/...）；自定义实例名匹配不到，
+    这时调用方应改用 is_qq_platform(event.get_platform_name())。
+    """
     return str(session or "").split(":", 1)[0].strip().lower() in _QQ_PLATFORMS
 
 
 def md_text(text: str) -> str:
     """把本插件的纯文本排版转成 QQ 原生 Markdown 友好排版。
 
-    只做结构转换，不改数字和名字：#码 → 二级标题（缩进行 → 列表项），
+    只做结构转换，不改数字和名字：行首 #码 前加零宽空格，避免被当标题放大；
     ───── → 水平分割线，座位行 → 无序列表，注: → 块引用，
     单换行 → 空行换行（QQ Markdown 的换行规则）。
     """
@@ -230,11 +248,12 @@ def md_text(text: str) -> str:
             in_seats = not in_seats
             out.append("***")
             continue
-        m = _CODE_LINE.match(line)
-        if m:
-            lead, code, tail = m.groups()
-            out.append(f"- {code}{tail}" if lead else f"## {code}{tail}")
-            continue
+        # 行首 #码（如 #ma27f）在 QQ 里会被当标题：井号被吃掉、文字放大。
+        # 在第一个 # 前插零宽空格，# 就不再是行首标记，井号原样显示、字号正常。
+        # 缩进行（比赛列表的 "  #m6484"）同样要保护，去掉前导空白后再判断。
+        if stripped.startswith("#"):
+            lead = len(line) - len(line.lstrip())
+            line = line[:lead] + _ZWSP + line[lead:]
         if stripped.startswith(_NOTE_MARK):
             out.append("> " + line.lstrip())
             continue
@@ -243,8 +262,15 @@ def md_text(text: str) -> str:
             continue
         if in_seats and stripped:
             line = "- " + line.lstrip()
-        # 名字里若带 Markdown 标记，换成全角，避免被渲染成斜体/删除线
-        line = line.replace("~~", "～～").replace("*", "＊").replace("_", "＿")
+        # 参数占位符 <AID|昵称|$AID> 的尖括号换成全角，避免被当自动链接吞掉内容
+        line = _ARG_TAG.sub(
+            lambda m: m.group(0) if m.group(1).startswith(
+                ("http://", "https://", "@")) else f"＜{m.group(1)}＞", line)
+        # 名字/帮助里的 Markdown 标记换成全角，避免被当链接/斜体/删除线解析：
+        # [码] 会被当链接标记，~~ *_ 会被当删除线/加粗/斜体。
+        # 本插件发送的全是纯文本参数说明，没有任何一处需要真的渲染成链接。
+        line = (line.replace("[", "［").replace("]", "］")
+                    .replace("~~", "～～").replace("*", "＊").replace("_", "＿"))
         out.append(line)
     # 相邻的列表项/引用行用单换行，段落之间空行（QQ Markdown 靠空行换行）
     parts: list[str] = []

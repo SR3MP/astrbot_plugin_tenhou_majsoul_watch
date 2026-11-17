@@ -46,7 +46,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
 from .tenhou_client import LogReplayParser
-from .broadcast import now_hm, start_text, is_qq_session, md_text
+from .broadcast import now_hm, start_text, is_qq_session, is_qq_platform, md_text
 from .th_live import (
     ThGameSession,
     ThWatcher,
@@ -682,12 +682,44 @@ class TenhouWatch(Star):
     PUSH_TRIES = 36
     PUSH_RETRY_WAIT = 5.0
 
-    def _md(self, session: str, text: str) -> str:
-        """QQ 官方把 Plain 当 Markdown 发，这里只在 QQ 会话做排版转换。"""
-        return md_text(text) if is_qq_session(session) else text
+    def _qq_platform_ids(self) -> set:
+        """所有 QQ 官方平台实例的 ID（即 unified_msg_origin 前缀）。
+
+        AstrBot 允许给同一类型配多个实例，前缀用的是自定义实例名（如「虎皮A梦」），
+        拿 event.get_platform_name() 才能知道真实类型。这里遍历实例，按类型反查 ID，
+        供没有 event 的主动推送判断是否要走 Markdown 转换。
+        """
+        ids = set()
+        try:
+            for p in self.context.platform_manager.platform_insts:
+                meta = p.meta()
+                if is_qq_platform(meta.name) or is_qq_platform(
+                        getattr(meta, "adapter_display_name", "")):
+                    if meta.id:
+                        ids.add(meta.id)
+        except Exception:
+            pass
+        return ids
+
+    def _md(self, session: str, text: str, platform_type: str = "") -> str:
+        """QQ 官方把 Plain 当 Markdown 发，这里只在 QQ 会话做排版转换。
+
+        判断优先级：事件真实类型 > 平台实例 ID > 会话前缀兜底。
+        """
+        qq = (is_qq_platform(platform_type) if platform_type else False)
+        if not qq:
+            qq = str(session or "").split(":", 1)[0].strip() in self._qq_platform_ids()
+        if not qq:
+            qq = is_qq_session(session)
+        return md_text(text) if qq else text
 
     def _maybe_md(self, event, text: str) -> str:
-        return self._md(str(event.session), text)
+        platform_type = ""
+        try:
+            platform_type = event.get_platform_name()
+        except Exception:
+            pass
+        return self._md(str(event.session), text, platform_type)
 
     def _reply(self, event, text: str):
         return event.make_result().message(self._maybe_md(event, text))
