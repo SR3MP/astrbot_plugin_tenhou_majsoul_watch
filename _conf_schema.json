@@ -1,8 +1,32 @@
 {
+  "report": {
+    "type": "object",
+    "description": "PT 定时报告",
+    "hint": "每天固定时刻给各群推送订阅玩家的 PT 变动榜。日报每天发，周报每周一、月报每月 1 号随日报一起发。需订阅了雀魂账号且能查到 PT 才有效。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用定时报告",
+        "hint": "关闭后不抓快照、不推送；手动指令 report 仍可用",
+        "default": false
+      },
+      "hour": {
+        "type": "int",
+        "description": "推送小时(0-23)",
+        "hint": "按容器本地时间；建议选群活跃的时段以降低主动消息被跳过",
+        "default": 12
+      },
+      "minute": {
+        "type": "int",
+        "description": "推送分钟(0-59)",
+        "default": 0
+      }
+    }
+  },
   "majsoul": {
     "type": "object",
     "description": "雀魂账号配置",
-    "hint": "用于雀魂玩家查询/对局监控的账号。留空则雀魂相关指令（msadd/mspt/监控）不可用，其余指令不受影响。",
+    "hint": "用于雀魂玩家查询与对局监控的账号。留空则雀魂相关指令与监控不可用，其余指令不受影响。",
     "items": {
       "email": {
         "type": "string",
@@ -19,27 +43,131 @@
       "token": {
         "type": "string",
         "description": "雀魂访问令牌",
-        "hint": "可选。已登录获取的 access_token，填了则跳过账号密码登录",
+        "hint": "已登录获取的 access_token，填写后跳过账号密码登录",
         "default": ""
       },
       "poll_interval": {
         "type": "int",
-        "description": "监控轮询间隔(秒)",
-        "hint": "后台检测订阅玩家对局状态的间隔，建议 20~60 秒",
+        "description": "监控轮询间隔",
+        "hint": "后台检测订阅玩家对局状态的间隔，单位秒",
         "default": 30
       }
     }
   },
   "koromo": {
     "type": "object",
-    "description": "牌谱屋昵称反查（可选）",
-    "hint": "只影响 mspt / msadd 按昵称查。牌谱屋自 2026-11 起要求 cap token，未配置时这两条只能按 AID 用（如 mspt 12345678）。需要昵称反查的话，可向牌谱屋作者申请 key 填在这里。",
+    "description": "牌谱屋昵称反查",
+    "hint": "设置按昵称查询牌谱屋玩家编号所需的访问凭证。留空时昵称查询与统计数据均可正常使用。",
     "items": {
       "token": {
         "type": "string",
-        "description": "牌谱屋 cap token",
-        "hint": "填写后作为 x-cap-token 请求头发给 amae-koromo；留空则昵称反查不可用，不影响 AID 查询与对局监控",
+        "description": "牌谱屋访问凭证",
+        "hint": "填写后用于牌谱屋昵称查询请求。留空不影响昵称反查、统计查询与对局监控。",
         "default": ""
+      }
+    }
+  },
+  "display": {
+    "type": "object",
+    "description": "播报显示增强",
+    "hint": "设置雀魂播报的数据来源与展示内容。保持默认时播报格式不变。",
+    "items": {
+      "rate_source": {
+        "type": "string",
+        "description": "数据来源",
+        "hint": "majsoul 使用雀魂官方统计。sapk 使用牌谱屋统计，并在段位后追加场数，玉与王座场（含东风场与三麻）追加安定段位。",
+        "default": "majsoul"
+      },
+      "tier_labels": {
+        "type": "bool",
+        "description": "安定标签",
+        "hint": "开启后按下方标签设置匹配安定段位，并在名字后追加命中的标签。仅 sapk 数据源生效。",
+        "default": false
+      },
+      "tiers": {
+        "type": "template_list",
+        "description": "安定标签设置",
+        "hint": "仅 sapk 数据源生效。设置安定段位区间与对应标签。上下限留空表示不限，按顺序取首个命中的标签。",
+        "templates": {
+          "tier": {
+            "name": "安定标签",
+            "items": {
+              "label": {
+                "type": "string",
+                "description": "标签文案",
+                "default": ""
+              },
+              "min": {
+                "type": "string",
+                "description": "下限",
+                "hint": "安定数值：雀豪一=1，雀圣一=4，雀圣三=6，每升一阶+1（雀豪二=2…雀豪三=3，雀圣二=5…）；可填小数如 1.5，负值表示雀豪一以下。留空不限。区间为左闭右开 [下限,上限)。",
+                "default": ""
+              },
+              "max": {
+                "type": "string",
+                "description": "上限",
+                "hint": "安定数值：雀豪一=1，雀圣一=4，雀圣三=6，每升一阶+1（雀豪二=2…雀豪三=3，雀圣二=5…）；可填小数如 1.5，负值表示雀豪一以下。留空不限。区间为左闭右开 [下限,上限)。",
+                "default": ""
+              }
+            }
+          }
+        },
+        "default": [
+          { "__template_key": "tier", "label": "顶级高手", "min": "7", "max": "" },
+          { "__template_key": "tier", "label": "高手", "min": "4", "max": "7" },
+          { "__template_key": "tier", "label": "好矿", "min": "", "max": "1" }
+        ]
+      },
+      "sanhaoyi_image": {
+        "type": "bool",
+        "description": "雀豪彩蛋",
+        "hint": "开启后，对局开始时恰好三家雀豪一，在该条播报后发送一张图片。",
+        "default": false
+      },
+      "point_alert": {
+        "type": "bool",
+        "description": "大牌文案开关",
+        "hint": "开启后，自动播报的对局中被订阅玩家和牌或放铳点数命中规则时发送对应文案。",
+        "default": false
+      },
+      "point_rules": {
+        "type": "template_list",
+        "description": "大牌文案规则",
+        "hint": "需开启大牌文案开关。设置点数区间、触发类型与文案。上下限留空表示不限。",
+        "templates": {
+          "rule": {
+            "name": "大牌文案",
+            "items": {
+              "type": {
+                "type": "string",
+                "description": "触发类型",
+                "options": ["和出", "点出", "两者"],
+                "default": "两者"
+              },
+              "min": {
+                "type": "string",
+                "description": "点数下限",
+                "hint": "留空不限",
+                "default": ""
+              },
+              "max": {
+                "type": "string",
+                "description": "点数上限",
+                "hint": "留空不限",
+                "default": ""
+              },
+              "text": {
+                "type": "string",
+                "description": "文案",
+                "default": ""
+              }
+            }
+          }
+        },
+        "default": [
+          { "__template_key": "rule", "type": "和出", "min": "12000", "max": "", "text": "笑嘻了" },
+          { "__template_key": "rule", "type": "点出", "min": "12000", "max": "", "text": "急哭了" }
+        ]
       }
     }
   }

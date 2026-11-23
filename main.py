@@ -29,10 +29,16 @@
   wginfo [WGID]   查询当前比分
 
   wglog <码或链接>  查询天凤牌谱详情
+
+  ctset <玩家名> [节点] <文案>  设定制文案；节点 start/round/big/finish，省略为 finish
+  ctdel <玩家名> [节点]        删定制文案（省略节点删全部）
+  ctl                          列出本群定制文案
+  report                       立即出本群 PT 日/周/月图片榜
 """
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -41,12 +47,14 @@ from typing import Optional
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Plain, Image
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 
 from .tenhou_client import LogReplayParser
-from .broadcast import now_hm, start_text, is_qq_session, is_qq_platform, md_text
+from .broadcast import (now_hm, start_text, is_qq_session, is_qq_platform,
+                        md_text, event_head, apply_custom_broadcast,
+                        split_point_mark)
 from .th_live import (
     ThGameSession,
     ThWatcher,
@@ -68,8 +76,13 @@ from .majsoul_client import (
     ms_level_text,
     ms_short_id,
     set_koromo_token,
+    set_display_config,
 )
-from .ms_live import MsGameSession
+from .koromo_stats import match_point_rules
+from .ms_live import MsGameSession, hule_head_line
+from . import report as report_mod
+from . import report_image
+from .web_api import WatchWebAPI
 
 
 HELP_TEXT = """\
@@ -97,6 +110,11 @@ mspt <AID|昵称|$AID>     查雀魂段位和 PT
 msls [场名|比赛号]       列出雀魂可跟踪对局
 msaddc <比赛号>          登记比赛场，wg 可跟踪、订阅玩家在该场开局会播报
 msdelc <比赛号>          取消登记比赛场
+
+ctset <玩家名> [节点] <文案>  设定制文案：start/round/big/finish，省略为 finish
+ctdel <玩家名> [节点]         删定制文案（省略节点删全部）
+ctl                           列出本群定制文案
+report                        立即出本群 PT 日/周/月图片榜（定时报告在配置里开）
 """
 
 
@@ -122,10 +140,19 @@ def _plugin_data_dir() -> str:
     return path
 
 
-@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.13.8")
+@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.15.0")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
+        # 保留配置对象给 WebUI 读写（Star 基类不保存 config）
+        self.config = config
+        # PT 定时报告配置（默认关闭，避免未经确认就往群里发东西）
+        rp_cfg = (config or {}).get("report") or {}
+        self._report_enabled = bool(rp_cfg.get("enabled", False))
+        self._report_hour = max(0, min(23, int(rp_cfg.get("hour", 12) or 12)))
+        self._report_minute = max(0, min(59, int(rp_cfg.get("minute", 0) or 0)))
+        self._report_task = None
+        self._report_last_day = ""
         # 天凤: session_id → {WGID → 对局跟踪任务}（只有 wg 显式指定才会往里放）
         self._th_sessions: dict[str, dict[str, ThGameSession]] = {}
         # 四位码 → 对局 的反查靠这份全段位房扫描缓存（60 秒内复用）
@@ -144,6 +171,27 @@ class TenhouWatch(Star):
         ms_cfg = (config or {}).get("majsoul") or {}
         # 牌谱屋反爬要 cap token：配置里填了就带上，没填就只按 AID 查
         set_koromo_token(str(((config or {}).get("koromo") or {}).get("token", "")))
+        # 播报显示增强（数据来源/安定标签/雀豪彩蛋/大牌文案）
+        display = (config or {}).get("display") or {}
+        self._point_alert = bool(display.get("point_alert", False))
+        point_rules = display.get("point_rules", []) or []
+        if isinstance(point_rules, str):
+            try:
+                point_rules = json.loads(point_rules)
+            except (ValueError, TypeError):
+                point_rules = []
+        if not self._point_alert:
+            point_rules = []   # 开关关闭时一条不发（即使规则里留着缺省文案）
+        self._point_rules = point_rules
+        set_display_config(
+            str(display.get("rate_source", "majsoul")),
+            display.get("tiers", []),
+            bool(display.get("sanhaoyi_image", False)),
+            point_rules,
+            bool(display.get("tier_labels", False)),
+        )
+        self._sanhaoyi_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "assets", "sanhaoyi.jpg")
         self._ms_client = MahjongSoulClient(
             email=str(ms_cfg.get("email", "")),
             password=str(ms_cfg.get("password", "")),
@@ -177,11 +225,17 @@ class TenhouWatch(Star):
         # 主循环在 initialize() 里抓取后才能安全调度推送，这里先不起线程
         self._loop = None
         self._hydrate_task = None
+        # 平台已被停用的会话，只提示一次，避免每条播报都刷同样的警告
+        self._push_dead: set[str] = set()
 
+        # 个人定制文案: session → {玩家名: 终局点评文案模板}。按 session+玩家
+        # 隔离，避免同一玩家在不同群的定制串台。随 sub_state 一起落盘。
+        self._custom_text: dict[str, dict[str, str]] = {}
         # 订阅/监听状态落盘（持久化）：存 data/plugin_data/<插件名>/，
         # 不写插件自身目录——插件目录升级时会被整目录替换，也便于用户迁移与审计。
         self._data_dir = _plugin_data_dir()
         self._state_file = os.path.join(self._data_dir, STATE_FILE_NAME)
+        self._history_file = os.path.join(self._data_dir, report_mod.HISTORY_FILE_NAME)
         # 旧版写在插件目录里，读到就一次性搬走，搬完留 .migrated 备查
         self._legacy_state_file = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), STATE_FILE_NAME
@@ -240,9 +294,20 @@ class TenhouWatch(Star):
         # 于是刚配好账号、还没订阅时 wgls 一直显示未登录，昵称反查也只能
         # 落到已经挂掉的牌谱屋上。登录放后台任务，不拖慢插件激活。
         self._hydrate_task = asyncio.create_task(self._ms_warmup())
+        # PT 定时报告：默认关闭；开启后每天在配置时刻抓快照并推送变动榜
+        if self._report_enabled:
+            self._report_task = asyncio.create_task(self._report_loop())
+        # AstrBot 内置 WebUI 管理页：注册后端 API（前端在 pages/tenhou-watch）
+        try:
+            self._web_api = WatchWebAPI(self)
+            self._web_api.register_routes(self.context)
+            logger.info("[tenhou] WebUI 管理页已注册")
+        except Exception as e:
+            logger.warning(f"[tenhou] WebUI 管理页注册失败（不影响群功能）: {e}")
         logger.info(
             f"[tenhou] 初始化完成: 天凤订阅{len(self._subs)}个, "
             f"雀魂订阅{len(self._ms_subs)}个（开局/终局自动播，逐局播报要 wg）"
+            + (f"，PT报告每天{self._report_hour:02d}:{self._report_minute:02d}" if self._report_enabled else "")
         )
 
     async def _ms_warmup(self) -> None:
@@ -346,6 +411,49 @@ class TenhouWatch(Star):
         subs = raw.get("th", {}) or {}
         ms_subs = raw.get("ms", {}) or {}
         ms_names = raw.get("ms_names", {}) or {}
+        custom = raw.get("custom_text", {}) or {}
+        _nodes = ("start", "round", "big", "finish")
+        if isinstance(custom, dict):
+            for sid, cmap in custom.items():
+                if not isinstance(cmap, dict):
+                    continue
+                norm = {}
+                for k, v in cmap.items():
+                    k = str(k)
+                    if isinstance(v, dict):
+                        # 新结构：{玩家: {节点: 模板}}，只留有内容的节点
+                        kept = {}
+                        for n in _nodes:
+                            nv = v.get(n)
+                            if n == "big" and isinstance(nv, dict):
+                                # big 可是结构化 {和出/点出/两者: [规则]}，保留
+                                rules = {}
+                                for kk in ("和出", "点出", "两者"):
+                                    arr = nv.get(kk)
+                                    if isinstance(arr, list) and arr:
+                                        rules[kk] = arr
+                                if rules:
+                                    kept[n] = rules
+                            elif n == "finish" and isinstance(nv, dict):
+                                # finish 可是结构化 {1/2/3/4/*: 模板}，按名次分档
+                                ranks = {}
+                                for rk, rv in nv.items():
+                                    if str(rk) not in ("1", "2", "3", "4", "*", "通用"):
+                                        continue
+                                    rv2 = str(rv or "").strip()
+                                    if rv2:
+                                        ranks[str(rk)] = rv2
+                                if ranks:
+                                    kept[n] = ranks
+                            elif str(nv or "").strip():
+                                kept[n] = str(nv).strip()
+                        if kept:
+                            norm[k] = kept
+                    elif str(v or "").strip():
+                        # 旧结构：{玩家: 点评模板} → 视作 finish
+                        norm[k] = str(v).strip()
+                if norm:
+                    self._custom_text[str(sid)] = norm
         for sid, sub in subs.items():
             players = set(sub.get("players", []))
             if not players:
@@ -409,9 +517,12 @@ class TenhouWatch(Star):
                 str(aid): nick
                 for aid, nick in self._ms_watcher.watching.items() if nick
             }
+            custom = {
+                sid: dict(cmap) for sid, cmap in self._custom_text.items() if cmap
+            }
             with open(self._state_file, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"th": th, "ms": ms, "ms_names": names},
+                    {"th": th, "ms": ms, "ms_names": names, "custom_text": custom},
                     f, ensure_ascii=False, indent=2,
                 )
         except Exception as e:
@@ -682,6 +793,40 @@ class TenhouWatch(Star):
     PUSH_TRIES = 36
     PUSH_RETRY_WAIT = 5.0
 
+    def _platform_state(self, session: str) -> str:
+        """会话前缀那个平台现在是什么状态：loaded / pending / disabled。
+
+        - loaded：适配器已注册，正常发。
+        - pending：配置里是启用的但实例还没注册（重启后适配器加载中），值得重试。
+        - disabled：配置里已停用或整个平台被删掉，重试永远不会成功——盲试 36 次
+          只会白占三分钟，还把播报全丢了（曾对停用的 OneBot 群连试 3 分钟）。
+        读不到配置就按 pending 处理，保持原来的重试行为。
+        """
+        pid = str(session or "").split(":", 1)[0].strip()
+        if not pid:
+            return "loaded"
+        try:
+            for p in self.context.platform_manager.platform_insts:
+                if getattr(p.meta(), "id", "") == pid:
+                    return "loaded"
+        except Exception:
+            return "pending"
+        try:
+            for cfg in (self.context.platform_manager.platforms_config or []):
+                if str(cfg.get("id") or "") == pid:
+                    return "pending" if cfg.get("enable") else "disabled"
+        except Exception:
+            return "pending"
+        return "disabled"
+
+    def _skip_dead_session(self, session: str) -> None:
+        """平台已停用：这条不发也不重试，同一会话只提示一次。"""
+        if session in self._push_dead:
+            return
+        self._push_dead.add(session)
+        logger.warning(
+            f"[push] 会话所属平台未启用，跳过播报（重新启用平台后自动恢复）: {session}")
+
     def _qq_platform_ids(self) -> set:
         """所有 QQ 官方平台实例的 ID（即 unified_msg_origin 前缀）。
 
@@ -743,13 +888,29 @@ class TenhouWatch(Star):
     def _reply(self, event, text: str):
         return event.make_result().message(self._maybe_md(event, text))
 
-    async def _push(self, session: str, text: str) -> None:
+    def _session_custom(self, session: str, text: str) -> str:
+        """手动查询（wg 等）的回执也套用本群定制文案。
+
+        只对含【对局开始】等节点标记的播报格式生效，普通回复原样返回。
+        """
+        try:
+            return apply_custom_broadcast(text, self._custom_text.get(session))
+        except Exception:
+            return text
+
+    async def _push(self, session: str, text: str, meta: dict = None) -> None:
+        if self._platform_state(session) == "disabled":
+            self._skip_dead_session(session)
+            return
+        # 个人定制文案：按本群配置重写开局/小局/大牌/终局四类节点播报
+        text = apply_custom_broadcast(text, self._custom_text.get(session), meta=meta)
         text = self._md(session, text)
         err = ""
         for i in range(self.PUSH_TRIES):
             try:
                 if await self.context.send_message(
                         session, MessageChain([Plain(text)])):
+                    self._push_dead.discard(session)
                     return
                 err = "send_message 返回 False"
             except Exception as e:
@@ -757,14 +918,33 @@ class TenhouWatch(Star):
             if i == 0:
                 logger.info(f"[push] 平台未就绪，稍后重发: {session}")
             await asyncio.sleep(self.PUSH_RETRY_WAIT)
+            # 等待期间平台被停用/删除就别再耗下去，剩下的尝试也不会成功
+            if self._platform_state(session) == "disabled":
+                self._skip_dead_session(session)
+                return
         logger.warning(f"推送丢弃（{self.PUSH_TRIES} 次未发出）: {session} {err}")
 
+    async def _push_image(self, session: str, path: str) -> None:
+        """给会话单独推一张本地图片（三家雀豪一发图）。"""
+        if not os.path.isfile(path):
+            logger.warning(f"[ms] 图片不存在，跳过发图: {path}")
+            return
+        if self._platform_state(session) == "disabled":
+            self._skip_dead_session(session)
+            return
+        try:
+            await self.context.send_message(
+                session, MessageChain([Image.fromFileSystem(path)]))
+        except Exception as e:
+            logger.warning(f"[ms] 发图失败: {type(e).__name__}: {e}")
+
     def _ms_notify(self, text: str, account_ids: set, field: str,
-                   mid: str = "") -> None:
+                   mid: str = "", extra: dict = None, meta: dict = None) -> None:
         """雀魂 watcher 的推送回调（在轮询线程里调用）。
 
         只推给真正订阅了这局选手、且筛选通过的会话。旧版广播给所有
         开启推送的群，一个群订阅的人开局，别的群也会收到。
+        extra 可带 sanhaoyi=True，开局那条之后给每个会话补发一张图。
         """
         loop = self._loop
         if loop is None:
@@ -789,8 +969,14 @@ class TenhouWatch(Star):
                 if self._ms_marked(self._ms_starts_seen, session, mid):
                     continue
                 self._ms_mark(self._ms_starts_seen, session, mid)
+
+            async def _send(dst=session):
+                await self._push(dst, text, meta=meta)
+                if extra and extra.get("sanhaoyi"):
+                    await self._push_image(dst, self._sanhaoyi_path)
+
             try:
-                asyncio.run_coroutine_threadsafe(self._push(session, text), loop)
+                asyncio.run_coroutine_threadsafe(_send(), loop)
             except Exception as e:
                 logger.warning(f"雀魂推送失败: {e}")
 
@@ -929,23 +1115,99 @@ class TenhouWatch(Star):
                         f"{ms_short_id(uuid_str)} 只用牌谱收终局")
             return
         acc = set(game.get("accounts") or ())
+        focus = self._ms_auto_focus(acc)
+        mid = ms_short_id(uuid_str)
         s = MsGameSession(uuid_str,
                           self._ms_auto_push(uuid_str, acc,
-                                             str(game.get("field") or ""),
-                                             ms_short_id(uuid_str)),
+                                             str(game.get("field") or ""), mid),
                           self._ms_client, game,
-                          watchers=self._ms_auto_focus(acc))
+                          watchers=focus,
+                          on_hule=lambda hand, names: self._ms_hule_texts(
+                              hand, names, focus, mid))
         self._ms_auto[uuid_str] = s
         s.start()
+
+    def _ms_hule_texts(self, hand: dict, names: list, focus: set,
+                       mid: str = "") -> list:
+        """功能4：未 wg 的自动流里，被订阅玩家和出/点出超阈值点数 → 大牌通报。
+
+        通报带和牌那一行的描述（局名 + 和牌家 + 自摸/荣和 + 点数 + 番符），
+        文案接在后面：`#mc361【大牌通报】12:06` / `东4局 … 26000 8番20符，笑嘻了。`
+        点出用同一行和牌描述，只换文案（如「急哭了」）。
+        和出：和牌家是订阅玩家，取其点数变化（after-before，正数）。
+        点出：荣和时点炮家是订阅玩家，取和牌家收益（即放铳损失）为正数。
+        文案由 display.point_rules 匹配；带哨兵前缀交回自动流出口放行。
+        """
+        if not focus:
+            return []
+        hules = hand.get("hules") or []
+        before = hand.get("before") or []
+        after = hand.get("after") or []
+        out: list[str] = []
+        if not hules:
+            return out
+
+        def delta(seat: int) -> int:
+            try:
+                return int(after[seat]) - int(before[seat])
+            except (IndexError, TypeError, ValueError):
+                return 0
+
+        ld = hand.get("last_discard") or []
+        seen = set()
+        for hu in hules:
+            seat = int(hu.get("seat") or 0)
+            who = names[seat] if 0 <= seat < len(names) else ""
+            gain = abs(delta(seat))
+            head = hule_head_line(hand, names, hu)   # 和牌通报行，点数后不带「点」
+
+            def emit(kind: str, texts) -> None:
+                for t in texts:
+                    key = (head, kind, t)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    body = f"{head}，{t}。" if head else t
+                    line = (event_head(mid, "大牌通报", now_hm())
+                            + "\n" + body) if mid else body
+                    # 把「和出/点出 + 本局点数」编码进哨兵前缀，交给定制文案层做
+                    # 分情况/分档匹配；非定制路径会在 _ms_auto_push 里剥掉 meta。
+                    out.append(self._POINT_MARK + f"{kind}|{gain}|" + line)
+
+            # 和出：和牌家本人是否被订阅
+            if who and any(who == f or (f and f in who) for f in focus):
+                emit("和出", match_point_rules("和出", gain, self._point_rules))
+            # 点出：荣和时点炮家是否被订阅（自摸没有点炮家）
+            if not hu.get("zimo") and ld and ld[1] == hu.get("hu"):
+                fromseat = int(ld[0])
+                loser = names[fromseat] if 0 <= fromseat < len(names) else ""
+                if loser and any(loser == f or (f and f in loser) for f in focus):
+                    emit("点出", match_point_rules("点出", gain, self._point_rules))
+        return out
 
     def _ms_auto_focus(self, account_ids) -> set:
         """终局那句点评的主角：这局里被订阅的那几个人的昵称。"""
         return {self._ms_watcher.watching.get(a, "")
                 for a in (account_ids or ())} - {""}
 
+    # 功能4文案的哨兵：自动流只放行【对局完成】，带这个前缀的单独放行再剥掉
+    _POINT_MARK = "\x00POINT\x00"
+    _PT_IMG_MARK = "\x00PTIMG\x00"   # _run_report 回执：后面跟图片路径，指令改发图
+
+    def _ms_split_point_mark(self, text: str) -> tuple[str, dict | None]:
+        """剥掉大牌通报的哨兵前缀，返回 (正文, {"kind","gain"})。
+
+        实现放在 broadcast.py（纯文本层），这里只做转发，方便单独测。
+        """
+        return split_point_mark(text, self._POINT_MARK)
+
     def _ms_auto_push(self, uuid_str: str, account_ids, field: str, mid: str):
-        """自动那条流的出口：只放行【对局完成】，播完让 watcher 别再等牌谱。"""
+        """自动那条流的出口：放行【对局完成】和功能4大点数文案，其余不发。"""
         async def push(text: str) -> None:
+            if text.startswith(self._POINT_MARK):
+                body, meta = self._ms_split_point_mark(text)
+                self._ms_notify(body, account_ids, field, "", meta=meta)
+                return
             if not is_finish_text(text):
                 return
             self._ms_notify(text, account_ids, field, mid)
@@ -975,6 +1237,8 @@ class TenhouWatch(Star):
         auto = self._ms_auto.pop(str(game["uuid"]), None)
         if auto is not None and not auto.finished:
             auto.stop()
+        # 大牌通报（功能4）只走自动流，wg 这条不挂 on_hule：
+        # 手动围观只要逐局结算，别再额外刷大牌通报。
         s = MsGameSession(game["uuid"], self._ms_make_push(session, mid),
                           self._ms_client, game, watchers=self._ms_focus(session, game))
         sess[mid] = s
@@ -1228,6 +1492,113 @@ class TenhouWatch(Star):
         sub["filters"] = list(args)
         self._save_state()
         yield self._reply(event, f"天凤筛选已设为: {', '.join(args)}")
+
+    # ==================================================================
+    #  指令: 个人定制文案 ctset / ctdel / ctl
+    # ==================================================================
+    _CT_NODES = {
+        "start": "开局", "round": "小局/流局", "big": "大牌通报", "finish": "终局",
+    }
+
+    @filter.command("ctset")
+    async def ctset(self, event: AstrMessageEvent, rest: GreedyStr):
+        """ctset <玩家名> [节点] <文案>：设定制文案，写入即生效。
+
+        节点可选 start/round/big/finish（省略默认 finish）。
+        可用 {name}{raw}{head}{body} 及各节点专属占位符；详见 WebUI。
+        """
+        args = (rest or "").strip()
+        if not args:
+            yield self._reply(event,
+                "用法: ctset <玩家名> [节点] <文案>\n"
+                "  节点: start开局 / round小局 / big大牌 / finish终局(默认)\n"
+                "例: ctset 豆沙团子 finish {name}喜提{place}名，点数{score}\n"
+                "例: ctset 豆沙团子 start 🚨{name}开打{game}\n"
+                "查看: ctl  删除: ctdel <玩家名> [节点]")
+            return
+        parts = args.split(None, 2)
+        if len(parts) < 2:
+            yield self._reply(event, "用法: ctset <玩家名> [节点] <文案>")
+            return
+        name, node, tpl = parts[0].strip(), "finish", ""
+        if len(parts) == 3 and parts[1].strip().lower() in self._CT_NODES:
+            node = parts[1].strip().lower()
+            tpl = parts[2].strip()
+        else:
+            tpl = " ".join(parts[1:]).strip()
+        if not tpl:
+            yield self._reply(event, "文案不能为空")
+            return
+        session = str(event.session)
+        cmap = self._custom_text.setdefault(session, {})
+        entry = cmap.get(name)
+        if isinstance(entry, dict):
+            entry[node] = tpl
+        else:
+            # 旧字符串视作 finish；新节点覆盖它
+            upgraded = {"finish": entry} if entry else {}
+            upgraded[node] = tpl
+            cmap[name] = upgraded
+        self._save_state()
+        yield self._reply(event,
+            f"已为「{name}」设置{self._CT_NODES[node]}定制文案:\n{tpl}")
+
+    @filter.command("ctdel")
+    async def ctdel(self, event: AstrMessageEvent, rest: GreedyStr = None):
+        """ctdel <玩家名> [节点]：删某玩家定制文案的节点；省略节点删全部。"""
+        args = (rest or "").strip()
+        session = str(event.session)
+        cmap = self._custom_text.get(session)
+        if not cmap:
+            yield self._reply(event, "本群没有定制文案。")
+            return
+        parts = args.split()
+        name = parts[0].strip() if parts else ""
+        node = parts[1].strip().lower() if len(parts) > 1 else ""
+        if not name:
+            yield self._reply(event,
+                "用法: ctdel <玩家名> [节点]\n当前定制: " +
+                (", ".join(sorted(cmap)) if cmap else "空"))
+            return
+        if name not in cmap:
+            yield self._reply(event, f"「{name}」没有定制文案。当前: " +
+                              (", ".join(sorted(cmap)) or "空"))
+            return
+        entry = cmap[name]
+        if node and node in self._CT_NODES and isinstance(entry, dict):
+            entry.pop(node, None)
+            if not entry:
+                del cmap[name]
+            what = f"{self._CT_NODES[node]}节点"
+        else:
+            del cmap[name]
+            what = "全部"
+        if not cmap:
+            self._custom_text.pop(session, None)
+        self._save_state()
+        yield self._reply(event, f"已删除「{name}」的{what}定制文案。")
+
+    @filter.command("ctl")
+    async def ctl(self, event: AstrMessageEvent):
+        """ctl：列出本群所有定制文案（按玩家×节点）。"""
+        session = str(event.session)
+        cmap = self._custom_text.get(session) or {}
+        if not cmap:
+            yield self._reply(event,
+                "本群没有定制文案。\n"
+                "设置: ctset <玩家名> [节点] <文案>\n"
+                "  节点: start开局 / round小局 / big大牌 / finish终局(默认)")
+            return
+        lines = [f"本群定制文案 ({len(cmap)} 名玩家):"]
+        for n, v in sorted(cmap.items()):
+            if isinstance(v, dict):
+                for node, tpl in v.items():
+                    label = self._CT_NODES.get(node, node)
+                    lines.append(f"  - {n} [{label}]: {tpl}")
+            else:
+                lines.append(f"  - {n} [终局]: {v}")
+        lines.append("删除: ctdel <玩家名> [节点]")
+        yield self._reply(event, "\n".join(lines))
 
     # ==================================================================
     #  指令: msadd / msdel / msfilter / mspt
@@ -1548,7 +1919,8 @@ class TenhouWatch(Star):
             return
         self._th_track(session, {"wg": wg, **(game or {})})
         focus = set((self._subs.get(session) or {}).get("players") or ())
-        yield self._th_start_text(game, wg, focus) + "\n" + self._watch_note("天凤", mid)
+        text = self._th_start_text(game, wg, focus) + "\n" + self._watch_note("天凤", mid)
+        yield self._session_custom(session, text)
 
     async def _ms_begin(self, session: str, hits: list[dict], code: str = ""):
         """开始雀魂那场的跟踪；回执就是那条【对局开始】，和天凤同一个骨架。"""
@@ -1572,10 +1944,11 @@ class TenhouWatch(Star):
         else:
             players = game.get("players") or []
             names = [p.get("nickname", "") for p in players]
-            yield (start_text(mid, ms_field_label(game.get("field") or ""),
-                              names, now_hm(), self._ms_focus(session, game),
-                              (), seats=False)
-                   + "\n" + self._watch_note("雀魂", mid))
+            text = (start_text(mid, ms_field_label(game.get("field") or ""),
+                               names, now_hm(), self._ms_focus(session, game),
+                               (), seats=False)
+                    + "\n" + self._watch_note("雀魂", mid))
+            yield self._session_custom(session, text)
         self._ms_track(session, game)
 
     @filter.command("wg")
@@ -1602,9 +1975,7 @@ class TenhouWatch(Star):
                 if hits:
                     lines += self._th_hit_lines(hits)
                 else:
-                    lines.append(
-                        f"  无（订阅: {' '.join(players)}，仅查段位房且受筛选限制）"
-                    )
+                    lines.append("  无")
             yield self._reply(event, "\n".join(lines))
             return
 
@@ -1991,10 +2362,217 @@ class TenhouWatch(Star):
         result = await loop.run_in_executor(None, LogReplayParser(code).parse)
         yield self._reply(event, result)
 
+    # ==================================================================
+    #  PT 定时报告：快照采集 + 日/周/月变动榜
+    # ==================================================================
+    def _all_subscribed_aids(self) -> list:
+        """所有会话订阅过的雀魂 AID（去重），快照按这个集合抓。"""
+        aids = set()
+        for sub in self._ms_subs.values():
+            for a in (sub.get("accounts") or ()):
+                try:
+                    aids.add(int(a))
+                except (TypeError, ValueError):
+                    continue
+        return sorted(aids)
+
+    def _collect_snapshot(self) -> dict:
+        """同步抓一轮订阅账号的段位/PT（在线程里跑）。查不到的账号跳过。"""
+        players = {}
+        watching = getattr(self._ms_watcher, "watching", {}) or {}
+        for aid in self._all_subscribed_aids():
+            try:
+                stats = self._ms_client.lookup_player(account_id=aid)
+            except Exception as e:
+                logger.debug(f"[report] AID {aid} PT 查询失败: {e}")
+                continue
+            entry = report_mod.player_from_stats(aid, stats)
+            if not entry:
+                continue
+            if not entry["name"] or entry["name"] == str(aid):
+                nick = watching.get(aid) or watching.get(str(aid)) or ""
+                if nick:
+                    entry["name"] = str(nick)
+            players[str(aid)] = entry
+        return players
+
+    async def _snapshot_now(self) -> tuple[str, dict]:
+        """抓一轮快照并存盘，返回 (今天日期, history)。"""
+        players = await asyncio.to_thread(self._collect_snapshot)
+        history = report_mod.load_history(self._history_file)
+        today = report_mod.today_key()
+        report_mod.record_snapshot(history, today, players)
+        report_mod.prune(history, today)
+        if not report_mod.save_history(self._history_file, history):
+            logger.warning("[report] 快照落盘失败")
+        return today, history
+
+    def _report_text(self, label: str, days: int, history: dict,
+                     today: str, aids=None) -> str:
+        """生成某一周期的变动榜文本。"""
+        changes = report_mod.compute_changes(history, today, days, aids)
+        baseline = report_mod.pick_baseline(history, today, days)
+        return report_mod.format_report(label, changes, baseline, today)
+
+    def _report_specs(self, today, history, aids, week: bool, month: bool) -> list:
+        """构造日/周/月报告的数据（每份一份 dict，供文本/图片共用）。"""
+        specs = [("日报", 1)]
+        if week:
+            specs.append(("周报", 7))
+        if month:
+            specs.append(("月报", 30))
+        out = []
+        for label, days in specs:
+            out.append({
+                "label": label,
+                "changes": report_mod.compute_changes(history, today, days, aids),
+                "baseline": report_mod.pick_baseline(history, today, days),
+                "today": today,
+            })
+        return out
+
+    def _report_image(self, specs: list, tag: str) -> str:
+        """把报告渲染成一张图片，返回路径；失败返回空串（调用方回退文字）。"""
+        try:
+            safe = "".join(c for c in str(tag) if c.isalnum())[-24:] or "all"
+            path = os.path.join(self._data_dir, f"pt_report_{safe}.png")
+            return report_image.render_report_png(specs, path) or ""
+        except Exception as e:
+            logger.warning(f"[report] 报告图片生成失败: {type(e).__name__}: {e}")
+            return ""
+
+    async def _run_report(self, manual: bool = False, session: str = "") -> str:
+        """抓快照 + 逐会话推送日/周/月。默认推图片，出图失败回退文字。
+
+        manual=True 且传了 session 时，榜单只取该群订阅的账号（按群隔离）；
+        未传 session 的手动调用（旧接口兼容）仍用全量账号。
+        返回值：手动模式且出图成功时是「_PT_IMG_MARK+图片路径」，指令据此发图；
+        否则是文字摘要（定时模式返回完整文本，仅用于日志）。
+        """
+        aids_all = self._all_subscribed_aids()
+        if not aids_all:
+            return "没有订阅任何雀魂账号，无法生成 PT 报告。"
+
+        # 手动触发按群隔离：只统计发起会话自己订阅的账号
+        aids_manual = aids_all
+        if manual and session:
+            sub = self._ms_subs.get(session) or {}
+            aids_manual = []
+            for a in (sub.get("accounts") or ()):
+                try:
+                    aids_manual.append(int(a))
+                except (TypeError, ValueError):
+                    continue
+            if not aids_manual:
+                return "本群没有订阅任何雀魂账号，无法生成 PT 报告。"
+
+        today, history = await self._snapshot_now()
+        now = datetime.datetime.now()
+        week = now.weekday() == 0 or manual
+        month = now.day == 1 or manual
+
+        # 手动：按本群账号出一张图；指令拿到路径后发图
+        if manual:
+            specs = self._report_specs(today, history, aids_manual, True, True)
+            img = self._report_image(specs, session or "manual")
+            if img:
+                return self._PT_IMG_MARK + img
+            return "\n\n".join(
+                report_mod.format_report(s["label"], s["changes"], s["baseline"], today)
+                for s in specs)
+
+        # 定时：每个会话按自己的订阅账号出图，发图失败/出图失败都回退文字
+        for session, sub in list(self._ms_subs.items()):
+            if not sub.get("enabled", True) or not (sub.get("accounts") or ()):
+                continue
+            aids = sub.get("accounts") or ()
+            specs = self._report_specs(today, history, aids, week, month)
+            img = self._report_image(specs, session)
+            sent = False
+            if img:
+                sent = await self._push_image_ok(session, img)
+            if not sent:
+                text = "\n\n".join(
+                    report_mod.format_report(s["label"], s["changes"], s["baseline"], today)
+                    for s in specs)
+                try:
+                    await self._push(session, text)
+                    sent = True
+                except Exception as e:
+                    logger.warning(f"[report] 推送失败 {session}: {e}")
+            if not sent:
+                logger.warning(f"[report] 会话推送未成功: {session}")
+        logger.info("[report] 已推送 PT 日报图片（周报/月报按日期附带）")
+        return "\n\n".join(
+            report_mod.format_report(s["label"], s["changes"], s["baseline"], today)
+            for s in self._report_specs(today, history, aids_all, week, month))
+
+    async def _push_image_ok(self, session: str, path: str) -> bool:
+        """发图并返回是否成功（供报告回退文字判断）。"""
+        if not os.path.isfile(path):
+            return False
+        if self._platform_state(session) == "disabled":
+            self._skip_dead_session(session)
+            return False
+        try:
+            ok = await self.context.send_message(
+                session, MessageChain([Image.fromFileSystem(path)]))
+            if ok:
+                self._push_dead.discard(session)
+            return bool(ok)
+        except Exception as e:
+            logger.warning(f"[report] 发图失败: {type(e).__name__}: {e}")
+            return False
+
+    async def _report_loop(self) -> None:
+        """每天在配置时刻抓一次快照并推送；同一天只发一次。"""
+        logger.info("[report] 定时报告任务已启动")
+        try:
+            while True:
+                now = datetime.datetime.now()
+                target = now.replace(hour=self._report_hour,
+                                     minute=self._report_minute, second=0, microsecond=0)
+                if now >= target:
+                    target += datetime.timedelta(days=1)
+                wait = (target - now).total_seconds()
+                await asyncio.sleep(max(1.0, wait))
+                day = report_mod.today_key()
+                if day == self._report_last_day:
+                    continue
+                self._report_last_day = day
+                try:
+                    await self._run_report(manual=False)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"[report] 定时报告执行失败: {e}")
+        except asyncio.CancelledError:
+            logger.info("[report] 定时报告任务已停止")
+
+    @filter.command("report")
+    async def report(self, event: AstrMessageEvent):
+        """report：立即抓一次 PT 快照并出日/周/月变动榜（不需开启定时）。"""
+        yield self._reply(event, "正在抓取订阅账号 PT 快照，请稍候…")
+        try:
+            text = await self._run_report(manual=True, session=str(event.session))
+        except Exception as e:
+            yield self._reply(event, f"PT 报告生成失败: {e}")
+            return
+        if text.startswith(self._PT_IMG_MARK):
+            img_path = text[len(self._PT_IMG_MARK):]
+            if os.path.isfile(img_path):
+                yield event.image_result(img_path)
+                return
+            yield self._reply(event, "PT 报告图片生成后丢失，请重试 report")
+            return
+        yield self._reply(event, text)
+
     async def terminate(self):
         # 热重载时旧实例的登录/补昵称任务要停掉，否则它会继续退避重试并刷日志
         if self._hydrate_task and not self._hydrate_task.done():
             self._hydrate_task.cancel()
+        if self._report_task and not self._report_task.done():
+            self._report_task.cancel()
         for sess in self._th_sessions.values():
             for s in sess.values():
                 s.stop()

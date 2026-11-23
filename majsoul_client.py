@@ -33,6 +33,7 @@ import websockets
 from astrbot.api import logger
 
 from .broadcast import finish_text, now_hm, rank_rows, room_start_text
+from .koromo_stats import (STABLE_MODES, stable_level_display, match_tier)
 from .ms.base import MSRPCChannel
 from .ms.rpc import Lobby, Route
 from .ms import protocol_pb2 as pb
@@ -49,6 +50,52 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # 而不是把"被反爬"伪装成"查无此人"。
 KOROMO_SHARDS = ("5", "1", "2", "4")
 KOROMO_SEARCH_TPL = "https://{sh}-data.amae-koromo.com/api/v2/{pl}/search_player/"
+# 牌谱屋统计接口（匿名可用，2026-11 实测三个分片都通；只有 player_records 要 token）
+# mode 必须可指定：安定段位与场次要按「单一场」的统计数据算（牌谱屋前端选中一个
+# mode 才显示安定/场次）。用多场混合数据套单一场常量会把金/王座的高得点混进来，
+# 曾把玉场 -1.83 算成 3.4；把各场场次累加，曾把玉场 29 战说成 277 战。
+# 组合口径现在只用于五率/段位，不用于安定和场次。
+KOROMO_MODE_ALL = "16.12.15.11.9.8"
+KOROMO_STATS_TPL = (
+    "https://{sh}-data.amae-koromo.com/api/v2/{pl}/{ep}/"
+    "{pid}/0/{ts}?mode={mode}&tag={tag}"
+)
+
+# 牌谱屋 GameMode（SAPikachu/amae-koromo src/data/types/gameMode.ts，2026-11 核对）：
+#   四人：金东=8 金=9 玉东=11 玉=12 王座东=15 王座=16
+#   三人：三金东=21 三金=22 三玉东=23 三玉=24 三王座东=25 三王座=26
+# 东风战和半庄战在牌谱屋是两个不同 mode（东的编号与同段位半庄不同），不能只按
+# 段位取；牌谱屋也不收录银/铜/初心，这几场没有牌谱屋统计。
+SAPK_THREE_MODES = frozenset({21, 22, 23, 24, 25, 26})
+# 安定段位按当前场自己的 GameMode 算（玉/王座、东风版、三麻玉/王座各有 delta）。
+# 不能拿不同场凑：三麻用 RANK_DELTA_3、基准 35000，套四人常量会算错。
+SAPK_STABLE_MODES = STABLE_MODES
+# 三人的多场组合（五率/段位回退用；四人对应 KOROMO_MODE_ALL）
+KOROMO_MODE_ALL_3 = "21.22.23.24.25.26"
+
+
+def sapk_field_mode(field: str) -> int:
+    """对局场名（如"四南玉"/"三東玉"）→ 牌谱屋 GameMode；无对应统计返回 0。
+
+    场名由 _MS_MODE_LABEL 的"四東/四南/三東/三南"加段位场拼成。三麻以"三"开头，
+    东风以"東/东"出现判定；比赛场名不带这两者，会落到 0（不显示牌谱屋场次）。
+    """
+    f = (field or "").strip()
+    three = f.startswith("三")
+    east = "東" in f or "东" in f
+    if "王座" in f:
+        if three:
+            return 25 if east else 26
+        return 15 if east else 16
+    if "玉" in f:
+        if three:
+            return 23 if east else 24
+        return 11 if east else 12
+    if "金" in f:
+        if three:
+            return 21 if east else 22
+        return 8 if east else 9
+    return 0
 
 # 牌谱屋最近一次被反爬拦下的原因（空串 = 没被拦过）
 _KOROMO_BLOCKED = ""
@@ -57,11 +104,67 @@ _KOROMO_TOKEN = ""
 # 官方昵称搜索不可用只警告一次，免得每查一个昵称刷一条
 _SEARCH_RPC_WARNED = False
 
+# 播报显示增强配置（由插件 display 分组注入；默认保持原行为）
+_RATE_SOURCE: str = "majsoul"        # "majsoul" | "sapk"
+_TIERS: list = []                    # 安定标签，元素 {"min","max","label"}
+_TIER_LABELS: bool = False           # 安定标签开关
+_SANHAOYI_IMAGE: bool = False        # 雀豪彩蛋开关
+_POINT_RULES: list = []              # 大牌自定义文案规则
+
 
 def set_koromo_token(token: str) -> None:
-    """由插件配置注入牌谱屋 cap token（留空表示没有）。"""
+    """由插件配置注入牌谱屋访问凭证（留空表示没有，匿名查询照常可用）。"""
     global _KOROMO_TOKEN
     _KOROMO_TOKEN = (token or "").strip()
+
+
+def set_display_config(rate_source: str, tiers, sanhaoyi_image: bool,
+                       point_rules, tier_labels: bool = True) -> None:
+    """由插件 display 分组注入播报增强配置。
+
+    tiers / point_rules 支持两种形态：
+      - WebUI template_list 的 list[dict]，元素带 __template_key，值为字符串；
+      - 旧版手填 JSON 字符串（兼容已升级但未重存配置的用户）。
+    统一归一化成 {"min": float|None, "max": float|None, ...}；空字符串按不限处理。
+    """
+    global _RATE_SOURCE, _TIERS, _SANHAOYI_IMAGE, _POINT_RULES, _TIER_LABELS
+    src = str(rate_source or "").strip().lower()
+    # koromo 是旧配置值，继续识别；对外文案统一用 sapk
+    _RATE_SOURCE = "sapk" if src in ("sapk", "koromo") else "majsoul"
+
+    def _norm_num(v):
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_rules(v):
+        if isinstance(v, str) and v.strip():
+            try:
+                v = json.loads(v)
+            except (ValueError, TypeError):
+                return []
+        if not isinstance(v, list):
+            return []
+        out = []
+        for item in v:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            row.pop("__template_key", None)
+            if "min" in row:
+                row["min"] = _norm_num(row.get("min"))
+            if "max" in row:
+                row["max"] = _norm_num(row.get("max"))
+            out.append(row)
+        return out
+
+    _TIERS = _parse_rules(tiers)
+    _POINT_RULES = _parse_rules(point_rules)
+    _SANHAOYI_IMAGE = bool(sanhaoyi_image)
+    _TIER_LABELS = bool(tier_labels)
 
 
 def _warn_search_once(msg: str) -> None:
@@ -148,6 +251,70 @@ def _koromo_search_player(pl: str, nickname: str) -> list:
             logger.debug(f"[koromo] 分片 {shard} 查询失败: {e}")
     return []
 
+
+def _koromo_pid(nickname: str, pl: str = "pl4") -> Optional[int]:
+    """牌谱屋按昵称精确反查 ID（pl4 四人 / pl3 三人）；重名/失败返回 None。
+
+    播报里的座位是游戏内昵称，取精确匹配的那条；pl3/pl4 的 id 是同一个账号 ID，
+    默认走 pl4，三麻对局用 pl3（只打三麻的号在 pl4 下可能搜不到）。
+    """
+    for item in _koromo_search_player(pl, nickname) or []:
+        if item.get("nickname") == nickname and item.get("id"):
+            try:
+                return int(item["id"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _koromo_stats(pid: int, ep: str = "player_stats",
+                  mode: str = KOROMO_MODE_ALL, pl: str = "pl4") -> dict:
+    """拉牌谱屋统计（匿名可用），逐个分片试。
+
+    ep = player_stats（场数/顺位/段位）或 player_extended_stats（和铳副立）。
+    pl = pl4（四人）/ pl3（三人）：三麻的 mode 是 21-26，用 pl4 查一律 404。
+    mode 默认多场组合（给五率用）；取场次/算安定必须传单一 mode。
+    返回 data 字典；全失败返回 {}。tag 按小时、ts 按毫秒，和牌谱屋前端一致。
+    """
+    ts = int(time.time() * 1000)
+    tag = int(time.time() // 3600)
+    for shard in KOROMO_SHARDS:
+        url = KOROMO_STATS_TPL.format(sh=shard, pl=pl, ep=ep,
+                                      pid=pid, ts=ts, tag=tag, mode=mode)
+        try:
+            data = _http_json(url, timeout=10)
+            if isinstance(data, dict):
+                return data.get("data", data) or {}
+        except Exception as e:
+            logger.debug(f"[koromo] {ep} 分片 {shard} 失败: {e}")
+    return {}
+
+
+def _koromo_extended_rate(stats: dict) -> str:
+    """牌谱屋扩展统计 → `顺2.38 和22.66% 铳12.09% 副32.95% 立17.91%`。
+
+    字段取 player_extended_stats：和牌率/放铳率/副露率/立直率；顺位用
+    player_stats 的 avg_rank（顺位均值，与雀魂"顺"同口径）。取不到就不写那列。
+    """
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    out = []
+    avg = num(stats.get("avg_rank"))
+    if avg is not None:
+        out.append(f"顺{avg:.2f}")
+    for key, mark in (("和牌率", "和"), ("放铳率", "铳"),
+                      ("副露率", "副"), ("立直率", "立")):
+        v = num(stats.get(key))
+        if v is not None:
+            # 牌谱屋返回的是小数比率（0.2257），要 ×100 才是百分数
+            out.append(f"{mark}{v * 100:.2f}%")
+    return " ".join(out)
+
+
 # 段位编码规则（新）：level.id = mode*10000 + tier*100 + star
 #   mode: 1=四人, 2=三人   tier: 1=初心 2=雀士 3=雀杰 4=雀豪 5=雀圣 6=魂天 7=魂天N
 # 实测：10503=雀圣三(四人) 20301=雀杰一(三人) 10719=魂天19(四人) 20720=魂天20(三人)
@@ -208,10 +375,16 @@ def ms_game_is_three(mode: int, player_count: int) -> bool:
     return player_count == 3
 
 
-# GameConfig.meta.mode_id → 段位场。只有这两个是实测锚定的（网页客户端进
-# "玉之间 四人南"页面请求的 filter_id=212，那一版返回的每行 mode_id=12；
-# 216 的每行 mode_id=16 且样本段位全在雀圣以上），其余值还没锚，落回段位推断。
-_MS_MODE_ID_FIELD = {12: "玉", 16: "王座"}
+# GameConfig.meta.mode_id → 段位场。mode_id 就是雀魂/牌谱屋的 GameMode：
+#   四人：金东8 金9 玉东11 玉12 王座东15 王座16
+#   三人：三金东21 三金22 三玉东23 三玉24 三王座东25 三王座26
+# 四人的 12/16 已由网页客户端请求参数实测锚定；其余按 GameMode 枚举对齐。
+# 三麻 221-226 不在 filter 表里，正是靠这张表读出"金/玉/王座"——否则会落到
+# 段位推断，把三麻玉之间（坐满雀豪）念成金之间。
+_MS_MODE_ID_FIELD = {
+    8: "金", 9: "金", 11: "玉", 12: "玉", 15: "王座", 16: "王座",
+    21: "金", 22: "金", 23: "玉", 24: "玉", 25: "王座", 26: "王座",
+}
 
 
 def ms_field_by_tiers(tiers: list[int]) -> str:
@@ -549,6 +722,9 @@ class MahjongSoulClient:
         self._rank_cache: dict = {}
         # 五个率缓存：account_id → (时间, fetchAccountStatisticInfo 结果)
         self._stat_cache: dict = {}
+        # 牌谱屋缓存：昵称 → (时间, {"pid","stats","extended"})；昵称→ID 很贵，缓存久一点
+        self._koromo_cache: dict = {}
+        self._KOROMO_TTL = 1800.0
         self._contest_cache: list = []
         self._contest_cache_at = 0.0
         # 已留过判场样本的 filter_id（见 _log_unanchored_mode）
@@ -802,6 +978,132 @@ class MahjongSoulClient:
             aid = p.get("account_id") if isinstance(p, dict) else None
             out.append(ms_rate_text(self._stat_mode(aid, mode)) if aid else "")
         return out
+
+    def _koromo_for_nick(self, nickname: str, mode: int = 0) -> dict:
+        """按昵称取牌谱屋 {"pid","stats","mode_stats"}，带 TTL 缓存。
+
+        先用 search_player 反查 ID，再拉统计接口；任一步失败返回空字典（播报就
+        少这一列，不编数）。mode = 当前对局的 GameMode（见 sapk_field_mode），决定
+        走 pl3(三麻)/pl4(四麻)、取哪一场的场数/五率/安定，以及缓存键（免得跨场
+        串数据）。只有该场牌谱屋没数据时才回退组合统计。
+        """
+        now = time.time()
+        key = f"{nickname}|{mode}"
+        hit = self._koromo_cache.get(key)
+        if hit and now - hit[0] < self._KOROMO_TTL:
+            return hit[1]
+        data: dict = {}
+        three = mode in SAPK_THREE_MODES
+        pl = "pl3" if three else "pl4"
+        pid = _koromo_pid(nickname, pl) if nickname else None
+        if pid is None and three:
+            pid = _koromo_pid(nickname, "pl4")  # 只打三麻但 pl3 没搜到时的兜底
+        if pid:
+            all_mode = KOROMO_MODE_ALL_3 if three else KOROMO_MODE_ALL
+            mode_stats: dict = {}
+
+            def _merged(one_mode: str) -> dict:
+                """一个 mode 的 stats + extended 合成一摊；取不到返回空字典。"""
+                st = _koromo_stats(pid, "player_stats", mode=one_mode, pl=pl)
+                if not st:
+                    return {}
+                ext = _koromo_stats(pid, "player_extended_stats",
+                                    mode=one_mode, pl=pl)
+                # 顺位均值 avg_rank 在 stats 里，和铳副立在 extended 里，合并成一摊。
+                # extended 的 count 是手数（几万），场次必须用 player_stats 的 count。
+                out = dict(st)
+                out.update(ext or {})
+                out["count"] = st.get("count")
+                return out
+
+            # 当前场的单一 mode 优先：牌谱屋前端选中一个 mode 才给该场的场数、
+            # 五率与安定。组合口径会把各段位场累加（曾把玉场 29 战说成 277 战）。
+            if mode:
+                one = _merged(str(mode))
+                if one:
+                    mode_stats[str(mode)] = one
+            merged = mode_stats.get(str(mode)) if mode else None
+            if not merged:
+                # 该场牌谱屋不收录（银/铜/初心、比赛场）才回退组合统计
+                merged = _merged(all_mode)
+            if merged:
+                data = {"pid": pid, "stats": merged, "mode_stats": mode_stats}
+        if data:
+            if len(self._koromo_cache) > 512:
+                self._koromo_cache.clear()
+            self._koromo_cache[key] = (now, data)
+        return data
+
+    def seat_koromo(self, players, bits: list, rates: list, three: bool,
+                    field_mode: int) -> tuple[list, list, list, int]:
+        """牌谱屋数据源 → (段位列, 五率行, 名字后缀档位, 雀豪一数量)。
+
+        field_mode = 当前对局的段位场 mode（见 sapk_field_mode）。
+        - 段位列 = 原段位 + `|本专场数战`；玉/王座场（含东风版与三麻）再加 `|安定位`。
+          场次按该单一场取：牌谱屋前端选中一个 mode 才显示对应场数，组合场数会把
+          金/铜/初心各场累加（曾把玉场 29 战说成 277 战）。取不到才回退组合场数。
+        - 安定同样按该单一场数据算，且用该场自己的 delta（三麻 RANK_DELTA_3、
+          基准 35000），不能用多场组合数据、也不能套别场的常量——否则金/王座的
+          高得点会把玉场安定整体抬高，三麻套四人常量会算错。
+        - 五率行取牌谱屋扩展统计；取不到沿用原雀魂五率 rates。
+        - 名字后缀 = 命中档位时 `|标签`（如 `|高手`），播报层拼成 `名字|高手 段位…`。
+        - 顺带数段位里"雀豪一"几家，供功能3判断。
+
+        查不到牌谱屋的座位原样保留雀魂 bits/rates，绝不编数。
+        """
+        out_bits: list = []
+        out_rates: list = []
+        suffixes: list = []
+        haoyi = 0
+        for i, p in enumerate(players or []):
+            nick = p.get("nickname") if isinstance(p, dict) else None
+            bit = bits[i] if i < len(bits) else ""
+            rate = rates[i] if i < len(rates) else ""
+            try:
+                seg, rate_txt, suffix = self._seat_koromo_one(nick, bit, rate,
+                                                              field_mode)
+            except Exception as e:
+                # 一个座位的数据异常不能带崩整轮播报：这个座位退回雀魂数据即可
+                logger.warning(
+                    f"[ms] 牌谱屋数据异常，座位回退雀魂数据: {nick} "
+                    f"{type(e).__name__}: {e}")
+                seg, rate_txt, suffix = bit, rate, ""
+            out_bits.append(seg)
+            out_rates.append(rate_txt)
+            suffixes.append(suffix)
+            if "雀豪一" in bit:
+                haoyi += 1
+        return out_bits, out_rates, suffixes, haoyi
+
+    def _seat_koromo_one(self, nick, bit: str, rate: str,
+                         field_mode: int) -> tuple[str, str, str]:
+        """单个座位的牌谱屋段位/场次/安定/五率/标签 → (段位列, 五率行, 名字后缀)。"""
+        data = self._koromo_for_nick(nick, field_mode) if nick else {}
+        if not data:
+            return bit, rate, ""
+        mode_stats = data.get("mode_stats") or {}
+        merged = (mode_stats.get(str(field_mode)) if field_mode else None) \
+            or data.get("stats") or {}
+        # 场次只取当前场：牌谱屋按场统计，各场累加会把玉场 29 战说成 277 战。
+        # 银/铜/初心与比赛场牌谱屋不收录（field_mode=0），不写场次。
+        if not field_mode:
+            seg = bit
+        else:
+            n = merged.get("count")
+            try:
+                count = int(n) if n is not None else 0
+            except (TypeError, ValueError):
+                count = 0
+            seg = f"{bit}|{count}战" if bit else f"{count}战"
+        stable_val, stable_txt = None, ""
+        if field_mode in SAPK_STABLE_MODES:
+            # 魂天玩家在王座场牌谱屋显示「魂天+x.xx」，普通玩家显示安豪/安圣；
+            # 数值档位匹配只用普通口径，魂天时没有对应档位就留空。
+            stable_val, stable_txt = stable_level_display(merged, field_mode)
+        if stable_txt:
+            seg += f"|{stable_txt}"
+        tier = match_tier(stable_val, _TIERS) if _TIER_LABELS else ""
+        return seg, (_koromo_extended_rate(merged) or rate), (f"|{tier}" if tier else "")
 
     def _stat_mode(self, account_id: int, mode: int) -> dict:
         """段位场统计里 mode 那一档；回包按账号缓存 20 分钟（和段位分同一口径）。"""
@@ -1630,8 +1932,10 @@ class MahjongSoulWatcher:
         hits, names = self._seats(game)
         mid = ms_short_id(game["uuid"])
         players = game.get("players") or []
-        bits = []
-        rates = []
+        bits: list = []
+        rates: list = []
+        suffixes: list = []
+        haoyi = 0
         if len(names) == len(players) and players:
             three = game.get("three")
             if three is None:
@@ -1640,9 +1944,22 @@ class MahjongSoulWatcher:
             # 这线程本来就是轮询线程，慢一点不影响别处
             bits = self.client.seat_bits(players, bool(three))
             rates = self.client.seat_rates(players, game.get("mode"))
-        self._notifier(room_start_text(mid, ms_field_label(game["field"]),
-                                       names, now_hm(), hits, bits, rates),
-                       set(game["accounts"]), game["field"], mid)
+            if _RATE_SOURCE == "sapk":
+                field = str(game.get("field") or "")
+                # 场次与安定都按当前场的单一 mode 取牌谱屋统计：
+                # 玉=12、王座=16、金=15、银=11、铜=9、初心=8；比赛场取不到就是 0。
+                field_mode = sapk_field_mode(field)
+                bits, rates, suffixes, haoyi = self.client.seat_koromo(
+                    players, bits, rates, bool(three), field_mode)
+            else:
+                # 雀魂数据源下也数一下雀豪一（三家发图开关与此数据源无关）
+                haoyi = sum(1 for b in bits if "雀豪一" in b)
+        text = room_start_text(mid, ms_field_label(game["field"]),
+                               names, now_hm(), hits, bits, rates, suffixes)
+        # extra：三家雀豪一发图信号，main 层按会话决定推哪张图
+        extra = {"sanhaoyi": bool(_SANHAOYI_IMAGE and haoyi == 3)}
+        self._notifier(text, set(game["accounts"]), game["field"], mid,
+                       extra=extra)
 
     def _try_record(self, uuid_str: str) -> Optional[dict]:
         """已结束对局的牌谱 head（含各家终局点数和段位分）；服务器还没给读就返回 None。"""

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>雀魂/天凤观战 · 管理</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@mdi/font@7.3.67/css/materialdesignicons.min.css">
+<link rel="stylesheet" href="./style.css?v=v3.15.0">
+</head>
+<body>
+<div id="app">
+  <nav id="sidebar">
+    <div class="sidebar-header">
+      <span class="mdi mdi-gamepad-variant"></span>
+      <span>观战管理</span>
+    </div>
+    <ul class="nav-list">
+      <li class="nav-item active" data-page="overview"><span class="mdi mdi-view-dashboard"></span><span>状态总览</span></li>
+      <li class="nav-item" data-page="subs"><span class="mdi mdi-bell-outline"></span><span>订阅管理</span></li>
+      <li class="nav-item" data-page="custom"><span class="mdi mdi-format-text"></span><span>定制文案</span></li>
+      <li class="nav-item" data-page="report"><span class="mdi mdi-chart-line"></span><span>PT 报告</span></li>
+      <li class="nav-item" data-page="config"><span class="mdi mdi-cog"></span><span>插件配置</span></li>
+    </ul>
+    <div class="sidebar-foot">天凤/雀魂云观战 · v3.15.0</div>
+  </nav>
+  <main id="content">
+    <div class="page-loading"><span class="mdi mdi-loading mdi-spin"></span><p>加载中...</p></div>
+  </main>
+</div>
+
+<div id="page-dialog" class="modal-overlay">
+  <div class="modal">
+    <div id="page-dialog-title" class="modal-title"></div>
+    <div id="page-dialog-input-wrap" class="form-group">
+      <label id="page-dialog-label" class="form-label"></label>
+      <input id="page-dialog-input" class="form-input">
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="resolvePageDialog(false)">取消</button>
+      <button class="btn btn-primary" onclick="resolvePageDialog(true)">确认</button>
+    </div>
+  </div>
+</div>
+<script src="/api/plugin/page/bridge-sdk.js"></script>
+<script src="./app.js?v=v3.15.0"></script>
+</body>
+</html>

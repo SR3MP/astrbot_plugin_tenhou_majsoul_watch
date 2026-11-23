@@ -219,6 +219,15 @@ def _seat_name(names: list[str], seat: int) -> str:
     return names[seat] if 0 <= seat < len(names) else f"seat{seat}"
 
 
+def hule_head_line(hand: dict, names: list[str], hu: dict) -> str:
+    """一炮的和牌通报行，供大牌通报复用。
+
+    形如 `东4局 0本場 Miaonana7 自摸 26000 8番20符`（荣和时是 `荣和 X`）。
+    与【小局结算】同款，只是点数后不写「点」，接在文案前读成一句话。
+    """
+    return _hule_lines(hu, hand, names, point_unit=False)[0]
+
+
 def hand_lines(hand: dict, names: list[str]) -> list[str]:
     """一局 → 与天凤【小局结算】/【流局】同款的几行，末尾都是逐家点数。"""
     if not hand["hules"]:
@@ -266,16 +275,23 @@ def _hanfu_text(hu: dict) -> str:
     return f"{han}番" if han else fu
 
 
-def _hule_lines(hu: dict, hand: dict, names: list[str]) -> list[str]:
-    """一个和了 → 标题行 + 手牌/副露/役（一炮多响就并列几段）。"""
+def _hule_lines(hu: dict, hand: dict, names: list[str],
+                point_unit: bool = True) -> list[str]:
+    """一个和了 → 标题行 + 手牌/副露/役（一炮多响就并列几段）。
+
+    point_unit=False 时点数后不写「点」（大牌通报接文案用）。
+    """
     who = _seat_name(names, hu["seat"])
     if hu["zimo"]:
         how = "自摸 "
     else:
         frm = _provider(hand, hu)
         how = "荣和 %s " % (_seat_name(names, frm) if frm is not None else "?")
+    paid = _paid_text(hu, hand)
+    if paid and not point_unit:
+        paid = paid[:-1] if paid.endswith("点") else paid   # 26000点 → 26000
     head = f"{hand['label']} {who} {how}" + " ".join(
-        p for p in (_paid_text(hu, hand), _hanfu_text(hu)) if p)
+        p for p in (paid, _hanfu_text(hu)) if p)
     if hu["yiman"]:
         head += " 役满"
     lines = [head]
@@ -467,11 +483,13 @@ class MsGameSession:
     END_WAIT = 90 * 60.0    # 断流后最多等这么久，靠牌谱补终局名次
 
     def __init__(self, uuid: str, push, client, game: Optional[dict] = None,
-                 watchers=None):
+                 watchers=None, on_hule=None):
         self.uuid = uuid
         self.mid = ms_short_id(uuid)
         self.push = push
         self.client = client
+        # 大点数文案回调：和牌时给 main 判被订阅玩家的和出/点出（仅未 wg 的自动流注入）
+        self.on_hule = on_hule
         game = game or {}
         self.field = game.get("field") or "未知场"
         self.names = [p.get("nickname", "") for p in (game.get("players") or [])]
@@ -685,6 +703,13 @@ class MsGameSession:
         self.last_scores = list(self._cur["after"])
         await self._emit(event_head(self.mid, "小局结算", now_hm()) + "\n"
                          + "\n".join(hand_lines(self._cur, self.names)))
+        if self.on_hule:
+            try:
+                texts = self.on_hule(self._cur, self.names)
+                for t in texts or []:
+                    await self._emit(t)
+            except Exception as e:
+                logger.debug(f"[ms] 大点数文案回调失败: {e}")
         self._cur = None
 
     async def _emit_liuju(self, hand: dict) -> None:
