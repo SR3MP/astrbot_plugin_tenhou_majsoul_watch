@@ -140,7 +140,7 @@ def _plugin_data_dir() -> str:
     return path
 
 
-@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.15.0")
+@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.15.1")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -1829,20 +1829,38 @@ class TenhouWatch(Star):
                 lines.append(f"  {s.brief()}")
         else:
             lines.append("天凤跟踪: 无")
+        def _aids(items) -> set:
+            """订阅账号可能是 int 也可能是 str，统一成 int 集合再比对。"""
+            out = set()
+            for a in (items or ()):
+                try:
+                    out.add(int(a))
+                except (TypeError, ValueError):
+                    pass
+            return out
+
         lines.append(f"天凤订阅: {len(sub['players'])} 人")
         f = sub.get("filters") or []
         lines.append(f"天凤筛选: {', '.join(f) if f else '不限'}")
         lines.append(f"天凤推送: {'开启' if sub['enabled'] else '关闭'}")
         lines.append(f"天凤监控: {'运行中' if self._th_watcher.running else '停止'}")
-        th_auto = [g for g in self._th_watcher.snapshot()
-                   if not sub.get("players") or (set(g["hits"]) & sub["players"])]
-        lines.append(f"天凤自动观战流: {len(self._th_auto)}/{self._TH_MAX_AUTO} 场")
-        if th_auto:
-            lines.append(f"天凤进行中对局 {len(th_auto)} 场:")
-            for g in th_auto:
+        th_players = set(sub.get("players") or ())
+        th_snapshot = self._th_watcher.snapshot()
+        th_auto_games = [g for g in th_snapshot
+                         if th_players & set(g.get("hits") or ())]
+        th_wg_hits = {str(g["wg"]).upper(): set(g.get("hits") or ())
+                      for g in th_snapshot}
+        th_auto_all = [s for s in self._th_auto.values() if not s.finished]
+        th_auto_mine = [s for s in th_auto_all
+                        if th_players & th_wg_hits.get(str(s.wg_id).upper(), set())]
+        lines.append(f"天凤自动观战流: 本群 {len(th_auto_mine)} 场"
+                     f"（全局 {len(th_auto_all)}/{self._TH_MAX_AUTO}）")
+        if th_auto_games:
+            lines.append(f"天凤进行中对局（本群） {len(th_auto_games)} 场:")
+            for g in th_auto_games:
                 lines.append(f"  #{g['mid']} {g['rule']} 始于{g['since']} {g['players']}")
         else:
-            lines.append("天凤进行中对局: 无")
+            lines.append("天凤进行中对局（本群）: 无")
         lines.append("")
         if ms_tracked:
             lines.append(f"雀魂跟踪 {len(ms_tracked)} 场:")
@@ -1850,6 +1868,7 @@ class TenhouWatch(Star):
                 lines.append(f"  {s.brief()}")
         else:
             lines.append("雀魂跟踪: 无")
+        ms_aids = _aids(ms_sub.get("accounts"))
         lines.append(f"雀魂订阅: {len(ms_sub['accounts'])} 人")
         ms_f = ms_sub.get("filters") or []
         lines.append(f"雀魂筛选: {', '.join(ms_f) if ms_f else '不限'}")
@@ -1860,15 +1879,20 @@ class TenhouWatch(Star):
             err = self._ms_client.last_error or "未连接"
             lines.append(f"雀魂登录: 未认证（{err}）")
         lines.append(f"雀魂监控: {'运行中' if self._ms_watcher.running else '停止'}")
-        ms_auto = [k for k, sess in self._ms_auto.items() if not sess.finished]
-        lines.append(f"雀魂自动观战流: {len(ms_auto)}/{self._MS_MAX_AUTO} 场")
-        games = self._ms_watcher.snapshot()
+        games_all = self._ms_watcher.snapshot()
+        games = [g for g in games_all if ms_aids & _aids(g.get("accounts"))]
+        ms_uuid_aids = {str(g["uuid"]): _aids(g.get("accounts")) for g in games_all}
+        ms_auto_all = [s for s in self._ms_auto.values() if not s.finished]
+        ms_auto_mine = [s for s in ms_auto_all
+                        if ms_aids & ms_uuid_aids.get(str(s.uuid), set())]
+        lines.append(f"雀魂自动观战流: 本群 {len(ms_auto_mine)} 场"
+                     f"（全局 {len(ms_auto_all)}/{self._MS_MAX_AUTO}）")
         if games:
-            lines.append(f"雀魂进行中对局 {len(games)} 场:")
+            lines.append(f"雀魂进行中对局（本群） {len(games)} 场:")
             for g in games:
                 lines.append(f"  #{g['mid']} {g['field']} 始于{g['since']} {g['players']}")
         else:
-            lines.append("雀魂进行中对局: 无")
+            lines.append("雀魂进行中对局（本群）: 无")
         if not self._ms_watcher.record_detail:
             lines.append("雀魂牌谱权限: 不可用")
 
