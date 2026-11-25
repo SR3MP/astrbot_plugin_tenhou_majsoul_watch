@@ -154,6 +154,65 @@ def focus_name(names, focus) -> str:
     return "、".join(hits)
 
 
+_LEAD_RE = re.compile(r"^(.+?)正在乱杀，快来围观:\s*$")
+_SCORE_LINE_RE = re.compile(r"^(.+?)\s+(-?[\d,]+)(?:\(([^)]*)\))?$")
+
+
+def localize_broadcast(text: str, focus) -> str:
+    """按目标群订阅名单重算播报主角，别把别群订阅玩家带进来。
+
+    watcher 线程只有「全场所有订阅玩家」这一个视角：`room_start_text` 的 hits、
+    `finish_text` 的 focus 都是全局并集。推送虽然按群筛了目标会话，文案里却还
+    留着别群玩家的名字和顺位点评。本函数在定制文案之前改两处：
+
+      - 开局第一行 `大号风风、虎皮猫正在乱杀，快来围观: `
+      - 终局 `【对局完成】#` 上方的顺位点评行
+
+    四家座位、段位、分数、节点标题都不动；本群名单为空时原样返回。
+    """
+    src = str(text or "")
+    names = [str(f or "").strip() for f in (focus or ()) if str(f or "").strip()]
+    if not src or not names:
+        return src
+    lines = src.split("\n")
+    start_at = next((i for i, ln in enumerate(lines) if "【对局开始】" in ln), -1)
+    finish_at = next((i for i, ln in enumerate(lines) if "【对局完成】" in ln), -1)
+
+    if start_at > 0:
+        m = _LEAD_RE.match(lines[0].strip())
+        if m:
+            hits = [h.strip() for h in re.split(r"[、,，]", m.group(1)) if h.strip()]
+            keep = [h for h in hits if name_hit(h, names)]
+            if keep:
+                lines[0] = "、".join(keep) + "正在乱杀，快来围观: "
+            else:
+                # 一个都对不上（昵称未反查/改名）：宁可不写主角，
+                # 也不能把别群订阅玩家的名字发给本群
+                lines.pop(0)
+                start_at -= 1
+                finish_at -= 1
+
+    if finish_at >= 0:
+        heads = [ln for ln in lines[:finish_at] if ln.strip()]
+        keep = [ln for ln in heads if name_hit(ln, names)]
+        if not keep and heads:
+            # 全局播报最多摘两名主角，本群玩家可能排在更后面：按分数行给自己补一句
+            scores = []
+            for ln in lines[finish_at + 1:]:
+                sm = _SCORE_LINE_RE.match(ln.strip())
+                if sm:
+                    scores.append(sm.group(1).strip())
+            for place, nm in enumerate(scores, 1):
+                if name_hit(nm, names):
+                    fallback = end_headline(nm, place, len(scores))
+                    if fallback:
+                        keep = [fallback]
+                    break
+        # 补不出来就一条点评都不留：别把别群玩家的顺位点评当本群消息发
+        lines = keep + lines[finish_at:]
+    return "\n".join(lines)
+
+
 def fmt_num(v) -> str:
     """44.1 / -38 / +52800：数字去掉多余的 .0，已经排好符号的原样保留。"""
     if isinstance(v, str):
@@ -237,7 +296,16 @@ def split_point_mark(text: str, mark: str = POINT_MARK):
         return src, None
     rest = src[len(mark):]
     head, sep, tail = rest.partition("\n")
-    bits = head.split("|", 2)
+    bits = head.split("|", 4)
+    if len(bits) == 5 and bits[0] in ("和出", "点出"):
+        # 触发玩家名 + AID 都带在哨兵里：推送层用 AID 精确判断本群订阅
+        body = bits[4] + (("\n" + tail) if sep else "")
+        return body, {"kind": bits[0], "gain": bits[1],
+                      "who": bits[2], "aid": bits[3]}
+    if len(bits) == 4 and bits[0] in ("和出", "点出"):
+        # 过渡格式（只有玩家名），旧三段格式继续兼容
+        body = bits[3] + (("\n" + tail) if sep else "")
+        return body, {"kind": bits[0], "gain": bits[1], "who": bits[2]}
     if len(bits) != 3 or bits[0] not in ("和出", "点出"):
         return rest, None
     body = bits[2] + (("\n" + tail) if sep else "")

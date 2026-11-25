@@ -497,6 +497,9 @@ class WatchWebAPI:
         p = self.plugin
         data = await request.json()
         session = str(data.get("session") or "")
+        # 空/伪造 session 会让 _run_report 退回全量账号，把别群榜单发出来
+        if not session or session not in getattr(p, "_ms_subs", {}):
+            return error_response("请先选择有效的群", status_code=400)
         text = await p._run_report(manual=True, session=session)
         mark = getattr(p, "_PT_IMG_MARK", "\x00PTIMG\x00")
         if text.startswith(mark):

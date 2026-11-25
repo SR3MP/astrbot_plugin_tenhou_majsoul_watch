@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -54,7 +55,7 @@ from astrbot.core.star.filter.command import GreedyStr
 from .tenhou_client import LogReplayParser
 from .broadcast import (now_hm, start_text, is_qq_session, is_qq_platform,
                         md_text, event_head, apply_custom_broadcast,
-                        split_point_mark)
+                        localize_broadcast, name_hit, split_point_mark)
 from .th_live import (
     ThGameSession,
     ThWatcher,
@@ -140,7 +141,7 @@ def _plugin_data_dir() -> str:
     return path
 
 
-@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.15.1")
+@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.15.2")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -263,22 +264,32 @@ class TenhouWatch(Star):
             return sid    # 没拿到平台实例，猜前缀只会迁移出一个对不上的 key
         return f"{platform_id}:GroupMessage:{sid}"
 
+    def _migrate_keys(self, store: dict) -> None:
+        """迁移旧版纯数字 key；已有完整 key 时合并而不是整块覆盖。"""
+        for key in list(store.keys()):
+            if ":" in key:
+                continue
+            nk = self._normalize_sid(key)
+            if nk == key:
+                continue
+            old = store.pop(key)
+            cur = store.get(nk)
+            if isinstance(old, dict) and isinstance(cur, dict):
+                merged = dict(old)
+                merged.update(cur)   # 完整 key 的数据优先
+                store[nk] = merged
+            else:
+                store[nk] = old
+
     async def initialize(self) -> None:
         """插件激活后调用：拉起雀魂/天凤轮询线程。"""
         # 监听线程要靠这个 loop 把推送调度回主循环；在别的线程里
         # get_event_loop() 会直接抛 RuntimeError，旧版就是这么把推送全吞掉的。
         self._loop = asyncio.get_running_loop()
-        # 迁移旧版纯数字 session key 为完整 origin
-        for key in list(self._subs.keys()):
-            if ":" not in key:
-                nk = self._normalize_sid(key)
-                if nk != key:
-                    self._subs[nk] = self._subs.pop(key)
-        for key in list(self._ms_subs.keys()):
-            if ":" not in key:
-                nk = self._normalize_sid(key)
-                if nk != key:
-                    self._ms_subs[nk] = self._ms_subs.pop(key)
+        # 迁移旧版纯数字 session key 为完整 origin（订阅、雀魂订阅、定制文案
+        # 都要迁，漏掉定制文案会让旧文案永久失配）
+        for store in (self._subs, self._ms_subs, self._custom_text):
+            self._migrate_keys(store)
         self._save_state()
         # 把恢复的雀魂账号喂给轮询器，再拉起线程（线程一跑就会用到 self._loop）
         for sid, sub in self._ms_subs.items():
@@ -902,6 +913,9 @@ class TenhouWatch(Star):
         if self._platform_state(session) == "disabled":
             self._skip_dead_session(session)
             return
+        # watcher 的文案是按「全场所有订阅玩家」拼的，转发到本群前先把主角
+        # 名单和顺位点评换成只有本群订阅的人（定制文案必须在这之后套）
+        text = localize_broadcast(text, self._focus_names(session))
         # 个人定制文案：按本群配置重写开局/小局/大牌/终局四类节点播报
         text = apply_custom_broadcast(text, self._custom_text.get(session), meta=meta)
         text = self._md(session, text)
@@ -960,6 +974,16 @@ class TenhouWatch(Star):
                 continue
             filters = sub.get("filters") or []
             if filters and not any(f in (field or "") for f in filters):
+                continue
+            # 大牌通报按全场订阅玩家触发，这里只发给真正订阅了和牌/放铳
+            # 那位玩家的群。优先用 AID 精确判断（昵称可能重复或互相包含），
+            # 老数据没有 AID 时才退回昵称匹配。
+            actor_aid = str((meta or {}).get("aid") or "")
+            actor = str((meta or {}).get("who") or "")
+            if actor_aid:
+                if actor_aid not in {str(a) for a in subscribed}:
+                    continue
+            elif actor and not name_hit(actor, self._focus_names(session)):
                 continue
             if mid and is_finish_text(text):
                 if self._ms_end_covered(session, mid):
@@ -1123,12 +1147,13 @@ class TenhouWatch(Star):
                           self._ms_client, game,
                           watchers=focus,
                           on_hule=lambda hand, names: self._ms_hule_texts(
-                              hand, names, focus, mid))
+                              hand, names, focus, mid,
+                              players=game.get("players") or []))
         self._ms_auto[uuid_str] = s
         s.start()
 
     def _ms_hule_texts(self, hand: dict, names: list, focus: set,
-                       mid: str = "") -> list:
+                       mid: str = "", players: list = None) -> list:
         """功能4：未 wg 的自动流里，被订阅玩家和出/点出超阈值点数 → 大牌通报。
 
         通报带和牌那一行的描述（局名 + 和牌家 + 自摸/荣和 + 点数 + 番符），
@@ -1155,13 +1180,21 @@ class TenhouWatch(Star):
 
         ld = hand.get("last_discard") or []
         seen = set()
+        plist = players or []
+
+        def seat_aid(seat: int) -> str:
+            try:
+                return str(plist[seat].get("account_id") or "")
+            except (IndexError, TypeError, AttributeError):
+                return ""
+
         for hu in hules:
             seat = int(hu.get("seat") or 0)
             who = names[seat] if 0 <= seat < len(names) else ""
             gain = abs(delta(seat))
             head = hule_head_line(hand, names, hu)   # 和牌通报行，点数后不带「点」
 
-            def emit(kind: str, texts) -> None:
+            def emit(kind: str, texts, actor: str = "", actor_aid: str = "") -> None:
                 for t in texts:
                     key = (head, kind, t)
                     if key in seen:
@@ -1170,19 +1203,22 @@ class TenhouWatch(Star):
                     body = f"{head}，{t}。" if head else t
                     line = (event_head(mid, "大牌通报", now_hm())
                             + "\n" + body) if mid else body
-                    # 把「和出/点出 + 本局点数」编码进哨兵前缀，交给定制文案层做
-                    # 分情况/分档匹配；非定制路径会在 _ms_auto_push 里剥掉 meta。
-                    out.append(self._POINT_MARK + f"{kind}|{gain}|" + line)
+                    # 把「和出/点出 + 本局点数 + 触发玩家」编码进哨兵前缀，
+                    # 供定制文案分档匹配、推送层按群过滤；旧三段格式仍可解析。
+                    out.append(self._POINT_MARK
+                               + f"{kind}|{gain}|{actor}|{actor_aid}|" + line)
 
             # 和出：和牌家本人是否被订阅
             if who and any(who == f or (f and f in who) for f in focus):
-                emit("和出", match_point_rules("和出", gain, self._point_rules))
+                emit("和出", match_point_rules("和出", gain, self._point_rules),
+                     who, seat_aid(seat))
             # 点出：荣和时点炮家是否被订阅（自摸没有点炮家）
             if not hu.get("zimo") and ld and ld[1] == hu.get("hu"):
                 fromseat = int(ld[0])
                 loser = names[fromseat] if 0 <= fromseat < len(names) else ""
                 if loser and any(loser == f or (f and f in loser) for f in focus):
-                    emit("点出", match_point_rules("点出", gain, self._point_rules))
+                    emit("点出", match_point_rules("点出", gain, self._point_rules),
+                         loser, seat_aid(fromseat))
         return out
 
     def _ms_auto_focus(self, account_ids) -> set:
@@ -2458,9 +2494,15 @@ class TenhouWatch(Star):
     def _report_image(self, specs: list, tag: str) -> str:
         """把报告渲染成一张图片，返回路径；失败返回空串（调用方回退文字）。"""
         try:
-            safe = "".join(c for c in str(tag) if c.isalnum())[-24:] or "all"
-            path = os.path.join(self._data_dir, f"pt_report_{safe}.png")
-            return report_image.render_report_png(specs, path) or ""
+            # 用完整 session 的哈希而不是截尾群号：不同平台实例的同一群号
+            # 不能共用一张图，否则定时报告会互相覆盖、群里可能收到别群榜单
+            digest = hashlib.sha1(str(tag).encode("utf-8")).hexdigest()[:16]
+            path = os.path.join(self._data_dir, f"pt_report_{digest}.png")
+            tmp = path + ".tmp"
+            if not report_image.render_report_png(specs, tmp):
+                return ""
+            os.replace(tmp, path)   # 原子落盘，避免并发时读到半张图
+            return path
         except Exception as e:
             logger.warning(f"[report] 报告图片生成失败: {type(e).__name__}: {e}")
             return ""
