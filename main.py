@@ -141,7 +141,7 @@ def _plugin_data_dir() -> str:
     return path
 
 
-@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.15.2")
+@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.15.3")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -228,6 +228,9 @@ class TenhouWatch(Star):
         self._hydrate_task = None
         # 平台已被停用的会话，只提示一次，避免每条播报都刷同样的警告
         self._push_dead: set[str] = set()
+        # 事件里确认过是 QQ 官方的实例名。刚重启时平台还没注册，主动推送
+        # 拿不到实例列表；记住这些前缀，避免 Markdown 转换被跳过。
+        self._qq_session_ids: set[str] = set()
 
         # 个人定制文案: session → {玩家名: 终局点评文案模板}。按 session+玩家
         # 隔离，避免同一玩家在不同群的定制串台。随 sub_state 一起落盘。
@@ -881,9 +884,10 @@ class TenhouWatch(Star):
 
         判断优先级：事件真实类型 > 平台实例 ID > 会话前缀兜底。
         """
+        sid = str(session or "").split(":", 1)[0].strip()
         qq = (is_qq_platform(platform_type) if platform_type else False)
         if not qq:
-            qq = str(session or "").split(":", 1)[0].strip() in self._qq_platform_ids()
+            qq = sid in self._qq_session_ids or sid in self._qq_platform_ids()
         if not qq:
             qq = is_qq_session(session)
         return md_text(text, self._focus_names(session)) if qq else text
@@ -894,6 +898,10 @@ class TenhouWatch(Star):
             platform_type = event.get_platform_name()
         except Exception:
             pass
+        if is_qq_platform(platform_type):
+            # 事件带的是真实平台类型，比主动推送时反查实例可靠；记下实例名，
+            # 下次 watcher 在平台注册完成前推送也能按 Markdown 排版。
+            self._qq_session_ids.add(str(event.session).split(":", 1)[0].strip())
         return self._md(str(event.session), text, platform_type)
 
     def _reply(self, event, text: str):
@@ -918,12 +926,14 @@ class TenhouWatch(Star):
         text = localize_broadcast(text, self._focus_names(session))
         # 个人定制文案：按本群配置重写开局/小局/大牌/终局四类节点播报
         text = apply_custom_broadcast(text, self._custom_text.get(session), meta=meta)
-        text = self._md(session, text)
         err = ""
         for i in range(self.PUSH_TRIES):
+            # 刚重启时平台实例可能还没注册完，第一次发出去的会被 QQ 当纯 Markdown
+            # 解析（# 变标题、引用丢失）。平台在重试间隔里就绪后必须重新排版。
+            payload = self._md(session, text)
             try:
                 if await self.context.send_message(
-                        session, MessageChain([Plain(text)])):
+                        session, MessageChain([Plain(payload)])):
                     self._push_dead.discard(session)
                     return
                 err = "send_message 返回 False"
