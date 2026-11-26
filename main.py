@@ -141,7 +141,7 @@ def _plugin_data_dir() -> str:
     return path
 
 
-@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.15.3")
+@register(PLUGIN_NAME, "SR3MP", "天凤/雀魂云观战", "3.15.4")
 class TenhouWatch(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -890,7 +890,12 @@ class TenhouWatch(Star):
             qq = sid in self._qq_session_ids or sid in self._qq_platform_ids()
         if not qq:
             qq = is_qq_session(session)
-        return md_text(text, self._focus_names(session)) if qq else text
+        if not qq:
+            return text
+        # 点击填入标签依赖 QQ 群聊的文本交互能力，私聊/其他平台一律只做排版。
+        # 群会话的 session 形如 <实例名>:GroupMessage:<群号>，用片段判断最稳。
+        qq_group = ":GroupMessage:" in str(session or "")
+        return md_text(text, self._focus_names(session), qq_group=qq_group)
 
     def _maybe_md(self, event, text: str) -> str:
         platform_type = ""

@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
+from urllib.parse import quote as _urlquote
 
 _MAX_HEADLINES = 2
 
@@ -652,20 +653,66 @@ def _esc_line(line: str) -> str:
                 .replace("~~", "～～").replace("*", "＊").replace("_", "＿"))
 
 
-def md_text(text: str, focus=()) -> str:
+# ---- QQ 官方群聊的「点击填入指令」标签 ----
+# 官方文档: https://bot.qq.com/wiki/develop/api-v2/server-inter/message/trans/text-chain.html
+# 群聊只支持参数指令 <qqbot-cmd-input text="..." show="..." reference="false" />：
+# 点击把 text（须 urlencode）填进输入框，不直接发出；回车指令 <qqbot-cmd-enter>
+# 官方明确不支持群聊，故不用。text 超过 100 字符会被 QQ 丢弃，这里的观战码都很短。
+_QQ_CMD_TAG = re.compile(r"<qqbot-cmd-input\b[^>]*/>")
+# 观战短码：天凤 4 位十六进制，雀魂 m + 4 位。统一成 m?[0-9a-fA-F]{4}。
+_QQ_WG_CODE = r"m?[0-9a-fA-F]{4}"
+
+
+def _qq_cmd_hint(cmd: str, show: str = "") -> str:
+    """生成一条点击后把 cmd 填进输入框的标签；show 是蓝色可点文字。"""
+    return (f'<qqbot-cmd-input text="{_urlquote(cmd, safe="")}" '
+            f'show="{_urlquote(show or cmd, safe="")}" reference="false" />')
+
+
+def inject_qq_cmd_tags(md: str) -> str:
+    """把 Markdown 正文里现成的观战指令包装成可点击标签（仅 QQ 官方群聊调用）。
+
+    处理三类行：
+      - 播报页脚 `> 实时观战输入 /wg abc1`
+      - wg/wginfo 等回执里的 `取消: /wg- abc1`
+      - wg 列表行 `→ wg abc1 | 场名 | 玩家`（列表行由命令排版输出 `wg ... |`）
+    只包住指令本身，不改其余文字；已是标签/非群聊场景不会被调用。
+    """
+    if not md:
+        return md
+
+    # 页脚："> 实时观战输入 /wg abc1"（前面可能有 > 引用符）
+    md = re.sub(rf"(^|\n)(>\s*实时观战输入\s+)(/wg\s+{_QQ_WG_CODE})(?=\s*$)",
+                lambda m: m.group(1) + m.group(2) + _qq_cmd_hint(m.group(3), m.group(3)),
+                md, flags=re.M)
+    # 取消：任意位置的 "取消: /wg- abc1"（行内，前面可能是正文）
+    md = re.sub(rf"(取消[:：]\s*)(/wg-\s+{_QQ_WG_CODE})\b",
+                lambda m: m.group(1) + _qq_cmd_hint(m.group(2), m.group(2)), md)
+    # 列表行：命令排版后形如 "> wg abc1 | 场名 | 玩家"。整段 "wg abc1" 就是可点文字，
+    # 不能再留一个裸 "wg "，否则显示成 "wg wg abc1"。
+    md = re.sub(rf"(^[ \t>]*)(wg\s+{_QQ_WG_CODE})(?=\s*\|)",
+                lambda m: m.group(1) + _qq_cmd_hint(m.group(2), m.group(2)),
+                md, flags=re.M)
+    return md
+
+
+def md_text(text: str, focus=(), qq_group: bool = False) -> str:
     """把本插件的纯文本排版转成 QQ 原生 Markdown 友好排版。
 
     播报与命令回复分两套：播报做页眉/页脚引用、统计行引用，并只加粗 focus
     里的订阅玩家；命令回复把"标题行后紧跟的缩进行"转引用。两者都不改文字。
 
     focus 由调用方按会话订阅名单传入（名字或 AID），其他平台不调用本函数。
+    qq_group 为真（QQ 官方 + 群会话）时，额外把观战指令换成可点击填入标签。
     """
     src = str(text or "")
     if not src:
         return src
     if _BROADCAST_TAG.search(src) or _SEAT_SEP in src:
-        return _md_broadcast(src, focus)
-    return _md_command(src)
+        out = _md_broadcast(src, focus)
+    else:
+        out = _md_command(src)
+    return inject_qq_cmd_tags(out) if qq_group else out
 
 
 def _protect_hash(raw: str) -> str:
